@@ -12,7 +12,12 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
+.tox/
+.nox/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 
 # Generated databases
@@ -21,6 +26,9 @@ htmlcov/
 *.db-wal
 *.sqlite
 *.sqlite3
+
+# Generated scan output
+/ESET_solution/scan_result.csv
 
 # Packaging and build output
 build/
@@ -32,3 +40,10 @@ dist/
 .vscode/
 .DS_Store
 Thumbs.db
+*.swp
+*.swo
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
