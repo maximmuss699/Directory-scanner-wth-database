@@ -13,6 +13,7 @@ def scan_folder(root_path):
     directories_to_scan = [root_path]
 
     while directories_to_scan:
+        # LIFO order to process the most recently discovered directories first
         current_directory = directories_to_scan.pop()
 
         with os.scandir(current_directory) as entries:
@@ -20,6 +21,7 @@ def scan_folder(root_path):
                 entry_path = entry.path
 
                 try:
+                    # follow_symlinks=False ensures we get the stat of the link itself
                     entry_stat = os.stat(entry_path, follow_symlinks=False)
                 except FileNotFoundError:
                     # The entry disappeared after os.scandir() returned it
@@ -35,6 +37,7 @@ def scan_folder(root_path):
                 # Store portable paths relative to the scanned root
                 relative_path = os.path.relpath(entry_path, root_path)
 
+                # Yield the entry information as a tuple for database insertion
                 yield (
                     relative_path,
                     os.path.dirname(relative_path),
@@ -46,6 +49,7 @@ def scan_folder(root_path):
                     entry_stat.st_ino,
                 )
 
+                # If the entry is a directory, add it to the stack for further scanning
                 if entry_type == "directory":
                     directories_to_scan.append(entry_path)
 
@@ -80,11 +84,24 @@ def main():
             """
         )
 
-        # Replace the old snapshot with the current scan in one transaction
-        connection.execute("DELETE FROM entries")
+        # Keep the new scan separate from the previous snapshot for comparison
+        connection.execute(
+            """
+            CREATE TEMP TABLE entries_snapshot (
+                path TEXT PRIMARY KEY,
+                parent_path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                entry_type TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                modified_ns INTEGER NOT NULL,
+                device_id INTEGER NOT NULL,
+                file_id INTEGER NOT NULL
+            ) WITHOUT ROWID
+            """
+        )
         connection.executemany(
             """
-            INSERT INTO entries (
+            INSERT INTO entries_snapshot (
                 path, parent_path, name, entry_type, size, modified_ns,
                 device_id, file_id
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -93,8 +110,23 @@ def main():
         )
 
         entry_count = connection.execute(
-            "SELECT COUNT(*) FROM entries"
+            "SELECT COUNT(*) FROM entries_snapshot"
         ).fetchone()[0]
+
+        # Comparison will be added next; for now, save the staged scan as current
+        connection.execute("DELETE FROM entries")
+        connection.execute(
+            """
+            INSERT INTO entries (
+                path, parent_path, name, entry_type, size, modified_ns,
+                device_id, file_id
+            )
+            SELECT
+                path, parent_path, name, entry_type, size, modified_ns,
+                device_id, file_id
+            FROM entries_snapshot
+            """
+        )
 
     print(f"Scanned {entry_count} entries")
     print(f"SQLite database saved to: {database_path}")
