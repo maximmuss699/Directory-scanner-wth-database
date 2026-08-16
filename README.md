@@ -207,6 +207,9 @@ Display all command-line options:
 python ESET_solution/main.py --help
 ```
 
+Expected input, filesystem, and database errors are printed as a short message
+to standard error, and the process exits with status code `1`.
+
 ## Tests
 
 Run the tests from the solution directory:
@@ -236,6 +239,17 @@ check. The first scan takes approximately
 `O(number of entries + total file bytes)`. Later scans take approximately
 `O(number of entries + bytes of files that need a new hash)`. Unchanged files
 are checked with metadata and do not need to be read again.
+
+## Known limitations
+
+- A userspace filesystem snapshot is not fully atomic. The scanner retries
+  observed races, but a change can still happen after the final metadata check.
+- A same-size content change can be missed if its modification time is also
+  restored, because the stored hash is considered reusable.
+- Hard links share one filesystem identity, so ambiguous hard-link changes are
+  reported conservatively as create and delete instead of a guessed rename.
+- Each SQLite database is bound to one root directory. A different root needs
+  a separate database file.
 
 ## Performance measurements
 

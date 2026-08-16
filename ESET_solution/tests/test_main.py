@@ -4,12 +4,12 @@ import sqlite3
 import stat as stat_module
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from cli import print_result
+from cli import main as cli_main, print_result
 from database import update_snapshot
 from hashing import FileChangedDuringHashingError, calculate_stable_hash
 from scanner import scan_folder
@@ -515,6 +515,17 @@ class UpdateSnapshotTests(unittest.TestCase):
 
         self.assertIn("Created  : 1", output.getvalue())
         self.assertNotIn("No changes detected.", output.getvalue())
+
+    def test_cli_prints_a_short_error_and_returns_failure(self):
+        """Check that an expected CLI error is shown without a traceback."""
+        output = io.StringIO()
+
+        with patch("cli.run", side_effect=ValueError("invalid input")):
+            with redirect_stderr(output):
+                exit_code = cli_main()
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(output.getvalue(), "Error: invalid input\n")
 
     def test_stable_hash_rejects_changed_device_at_final_path_check(self):
         """Check that hashing rejects a file replaced on another device."""

@@ -1,8 +1,11 @@
 import argparse
 import os
+import sqlite3
+import sys
 import time
 
 from database import update_snapshot
+from hashing import FileChangedDuringHashingError
 from models import ScanResult
 
 
@@ -81,6 +84,7 @@ def print_result(
 
 
 def run() -> None:
+    """Parse arguments, update the snapshot, and print the result."""
     arguments = parse_arguments()
     started_at = time.perf_counter()
     result = update_snapshot(
@@ -95,3 +99,18 @@ def run() -> None:
         arguments.database,
         elapsed_seconds,
     )
+
+
+def main() -> int:
+    """Run the CLI and return a process exit code."""
+    try:
+        run()
+    except (
+        OSError,
+        ValueError,
+        sqlite3.Error,
+        FileChangedDuringHashingError,
+    ) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    return 0
