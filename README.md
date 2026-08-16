@@ -239,3 +239,20 @@ check. The first scan takes approximately
 `O(number of entries + total file bytes)`. Later scans take approximately
 `O(number of entries + bytes of files that need a new hash)`. Unchanged files
 are checked with metadata and do not need to be read again.
+
+## Performance measurements
+
+The following local benchmark used 10,000 files of 1 KiB each, distributed
+across 100 directories. The database was stored outside the scanned directory.
+The measurement was run on macOS ARM64 with Python 3.9.6 using the CLI timer.
+
+| Scenario | Entries | Result | Duration |
+|---|---:|---|---:|
+| First scan | 10,100 | 10,100 created | 0.91 s |
+| Unchanged scan | 10,100 | No changes | 0.28-0.29 s |
+| 100 files changed from 1 KiB to 2 KiB | 10,100 | 100 modified | 0.29 s |
+
+The unchanged scan is faster because valid stored hashes are reused instead of
+reading every file again. These numbers are illustrative: filesystem type,
+storage speed, cache state, file sizes, antivirus software, and operating
+system behavior can significantly affect real results.
