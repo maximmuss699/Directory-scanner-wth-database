@@ -121,10 +121,7 @@ def insert_reported_renames(connection: sqlite3.Connection) -> None:
         )
 
 
-def detect_changes(
-    connection: sqlite3.Connection,
-    compare_content_hashes: bool,
-) -> Dict[str, int]:
+def detect_changes(connection: sqlite3.Connection) -> Dict[str, int]:
     """Find changes between two snapshots."""
     connection.execute(
         """
@@ -172,15 +169,13 @@ def detect_changes(
         JOIN entries_snapshot AS snapshot ON snapshot.path = match.path
         WHERE snapshot.entry_type = 'file'
           AND CASE
-              WHEN ?
-               AND previous.content_hash IS NOT NULL
+              WHEN previous.content_hash IS NOT NULL
                AND snapshot.content_hash IS NOT NULL
               THEN previous.content_hash IS NOT snapshot.content_hash
               ELSE previous.size != snapshot.size
                 OR previous.modified_ns != snapshot.modified_ns
           END
-        """,
-        (compare_content_hashes,),
+        """
     )
     connection.execute(
         """

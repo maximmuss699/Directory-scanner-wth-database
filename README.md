@@ -60,7 +60,7 @@ modular without adding unnecessary class hierarchies.
 ```mermaid
 flowchart TD
     A[Directory] --> B[Iterative scan with os.scandir]
-    B --> H[Stable content hashing]
+    B --> H[Reuse valid hashes or hash file content]
     H --> C[(Temporary entries_snapshot)]
     D[(Previous entries)] --> M[Entity matching]
     C --> M
@@ -93,9 +93,9 @@ flowchart LR
 
 - **Create:** a new entity cannot be matched to a previous entity.
 - **Delete:** a previous entity cannot be matched to a new entity.
-- **Modify:** a matched regular file has different content. In `always` and
-  `changed`, two available hashes are authoritative; otherwise size and
-  modification time are used as a fallback.
+- **Modify:** a matched regular file has different content. When both hashes
+  are available, they are authoritative; otherwise size and modification time
+  are used as a fallback.
 - **Rename:** one unique, non-zero filesystem identity has a different path.
 
 Rename detection is intentionally conservative. If an identity appears more
@@ -171,22 +171,17 @@ Show at most five detected changes:
 python ESET_solution/main.py --show-changes 5
 ```
 
-Choose a content hashing strategy:
+### Hashing strategy
 
-```bash
-python ESET_solution/main.py --hash-mode always
-python ESET_solution/main.py --hash-mode changed
-python ESET_solution/main.py --hash-mode off
-```
+The first scan hashes every regular file. Later scans reuse a stored hash when
+the file identity, size, and modification time are unchanged. A hash can also
+be reused after a rename when the filesystem identity is unique. New and
+metadata-changed files are hashed again.
 
-- `always` is the default and hashes every regular file on every scan. It is
-  the reliable option when size and modification time may be preserved.
-- `changed` reuses a stored hash when path, size, modification time, device ID,
-  and file ID are unchanged. It can also reuse a hash after a rename when the
-  identity is unique. It is faster but cannot detect a deliberately hidden
-  content change with identical metadata.
-- `off` compares metadata only and does not read file contents. It preserves a
-  previous hash while the identity and hash-validating metadata still match.
+This single strategy balances content-based modification detection with the
+performance required for large directory trees. Like any metadata shortcut, it
+cannot detect a same-size content change when the modification time is also
+deliberately restored to its previous value.
 
 Example summary:
 
@@ -195,7 +190,6 @@ Directory snapshot updated
 ==========================
 Folder   : /path/to/folder
 Database : /path/to/state.db
-Hashing  : always
 Duration : 2.50 s
 Entries  : 49,102
 
@@ -226,10 +220,10 @@ python -m unittest discover -s tests -v
 ```
 
 Tests cover create, delete, content modification, rename collisions and swaps,
-same-path replacement, directory-tree renames, hard-link ambiguity, hash modes,
-restored timestamps, database root binding, incremental writes,
-retry behavior, input validation, stable hashing, Windows-sized file IDs,
-junction handling, and transaction rollback.
+same-path replacement, directory-tree renames, hard-link ambiguity, hash reuse,
+database root binding, incremental writes, retry behavior, input validation,
+stable hashing, Windows-sized file IDs, junction handling, and transaction
+rollback.
 
 ## Stable hashing and performance
 
@@ -241,7 +235,7 @@ old open descriptor remains readable. An unstable file is retried once; the
 complete directory scan is then retried once before the transaction is aborted.
 
 No userspace scanner can eliminate a filesystem race after its final metadata
-check. Hashing every file changes scan complexity from approximately
-`O(number of entries)` to `O(number of entries + total file bytes)`. The
-`changed` and `off` modes provide explicit performance tradeoffs for very large
-directory structures.
+check. The first scan takes approximately
+`O(number of entries + total file bytes)`. Later scans take approximately
+`O(number of entries + bytes of files that need a new hash)`. Unchanged files
+are checked with metadata and do not need to be read again.

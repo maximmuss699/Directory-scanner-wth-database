@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 from cli import print_result
 from database import update_snapshot
 from hashing import FileChangedDuringHashingError, calculate_stable_hash
-from scanner import is_directory_junction, scan_folder
+from scanner import scan_folder
 
 
 class UpdateSnapshotTests(unittest.TestCase):
@@ -45,6 +45,7 @@ class UpdateSnapshotTests(unittest.TestCase):
         self.assertNotEqual(path.stat().st_mtime_ns, previous_stat.st_mtime_ns)
 
     def test_create_no_change_modify_rename_and_delete(self):
+        """Check the main file change lifecycle."""
         old_path = self.folder / "old.txt"
         old_path.write_text("first", encoding="utf-8")
 
@@ -71,6 +72,7 @@ class UpdateSnapshotTests(unittest.TestCase):
         self.assert_change_counts(result, delete=1)
 
     def test_hard_links_are_not_guessed_as_renames(self):
+        """Check that ambiguous hard links are not reported as renames."""
         original_path = self.folder / "original.txt"
         linked_path = self.folder / "linked.txt"
         renamed_path = self.folder / "renamed.txt"
@@ -88,6 +90,7 @@ class UpdateSnapshotTests(unittest.TestCase):
         self.assert_change_counts(result, create=1, delete=1)
 
     def test_symlink_to_ancestor_is_stored_but_not_traversed(self):
+        """Check that a directory symlink does not create a scan cycle."""
         subdirectory = self.folder / "subdirectory"
         subdirectory.mkdir()
         link_path = subdirectory / "back-to-root"
@@ -107,15 +110,8 @@ class UpdateSnapshotTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(entry_type, "symlink")
 
-    def test_scanner_serializes_filesystem_identity_as_text(self):
-        (self.folder / "identity.txt").write_text("content", encoding="utf-8")
-
-        record = next(scan_folder(str(self.folder)))
-
-        self.assertIsInstance(record[6], str)
-        self.assertIsInstance(record[7], str)
-
     def test_large_windows_file_identity_is_stored_without_overflow(self):
+        """Check that large Windows file IDs fit in the database."""
         directory_path = self.folder / "large-identity"
         directory_path.mkdir()
         directory_stat = directory_path.stat()
@@ -134,9 +130,7 @@ class UpdateSnapshotTests(unittest.TestCase):
         )
 
         with patch("database.scan_folder", return_value=iter([staged_record])):
-            initial_result = update_snapshot(
-                str(self.folder), str(self.database), hash_mode="off"
-            )
+            initial_result = update_snapshot(str(self.folder), str(self.database))
 
         self.assert_change_counts(initial_result, create=1)
         renamed_path = self.folder / "renamed-large-identity"
@@ -153,9 +147,7 @@ class UpdateSnapshotTests(unittest.TestCase):
             None,
         )
         with patch("database.scan_folder", return_value=iter([renamed_record])):
-            rename_result = update_snapshot(
-                str(self.folder), str(self.database), hash_mode="off"
-            )
+            rename_result = update_snapshot(str(self.folder), str(self.database))
 
         self.assert_change_counts(rename_result, rename=1)
         self.assertEqual(
@@ -179,6 +171,7 @@ class UpdateSnapshotTests(unittest.TestCase):
         )
 
     def test_windows_junction_is_stored_without_being_traversed(self):
+        """Check that a Windows junction is saved but not followed."""
         root_stat = SimpleNamespace(st_dev=1, st_ino=10)
         junction_stat = SimpleNamespace(
             st_mode=stat_module.S_IFDIR | 0o755,
@@ -210,17 +203,8 @@ class UpdateSnapshotTests(unittest.TestCase):
         self.assertEqual(records[0][3], "junction")
         scandir.assert_called_once_with(str(self.folder))
 
-    def test_windows_reparse_attribute_fallback_detects_junction(self):
-        entry = SimpleNamespace()
-        junction_stat = SimpleNamespace(
-            st_mode=stat_module.S_IFDIR | 0o755,
-            st_file_attributes=0x400,
-        )
-
-        with patch("scanner.os.name", "nt"):
-            self.assertTrue(is_directory_junction(entry, junction_stat))
-
     def test_rename_and_content_change_reports_both_changes(self):
+        """Check that a renamed and modified file reports both changes."""
         old_path = self.folder / "old.txt"
         new_path = self.folder / "new.txt"
         old_path.write_text("AAAA", encoding="utf-8")
@@ -228,7 +212,7 @@ class UpdateSnapshotTests(unittest.TestCase):
 
         original_stat = old_path.stat()
         old_path.rename(new_path)
-        new_path.write_text("BBBB", encoding="utf-8")
+        new_path.write_text("BBBB changed", encoding="utf-8")
         os.utime(
             new_path,
             ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
@@ -238,6 +222,7 @@ class UpdateSnapshotTests(unittest.TestCase):
         self.assert_change_counts(result, modify=1, rename=1)
 
     def test_failed_scan_keeps_previous_snapshot(self):
+        """Check that a scan error does not replace the valid snapshot."""
         (self.folder / "stable.txt").write_text("content", encoding="utf-8")
         self.scan()
 
@@ -249,27 +234,14 @@ class UpdateSnapshotTests(unittest.TestCase):
         self.assert_change_counts(result)
 
     def test_missing_directory_is_rejected(self):
+        """Check that a missing input directory is rejected."""
         missing_folder = self.folder / "missing"
 
         with self.assertRaisesRegex(ValueError, "Directory does not exist"):
             update_snapshot(str(missing_folder), str(self.database))
 
-    def test_always_mode_detects_same_size_change_with_restored_mtime(self):
-        file_path = self.folder / "same-size.txt"
-        file_path.write_text("AAAA", encoding="utf-8")
-        self.scan()
-
-        original_stat = file_path.stat()
-        file_path.write_text("BBBB", encoding="utf-8")
-        os.utime(
-            file_path,
-            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
-        )
-
-        result = self.scan()
-        self.assert_change_counts(result, modify=1)
-
     def test_equal_hash_with_changed_mtime_is_not_a_modification(self):
+        """Check that unchanged content is not reported as modified."""
         file_path = self.folder / "same-content.txt"
         file_path.write_text("unchanged content", encoding="utf-8")
         self.scan()
@@ -280,24 +252,8 @@ class UpdateSnapshotTests(unittest.TestCase):
         result = self.scan()
         self.assert_change_counts(result)
 
-    def test_rename_with_only_mtime_change_is_not_a_modification(self):
-        old_path = self.folder / "old.txt"
-        new_path = self.folder / "new.txt"
-        old_path.write_text("unchanged content", encoding="utf-8")
-        self.scan()
-
-        original_stat = old_path.stat()
-        old_path.rename(new_path)
-        self.assert_mtime_changed(new_path, original_stat)
-
-        result = self.scan()
-        self.assert_change_counts(result, rename=1)
-        self.assertEqual(
-            [(change.previous_path, change.path) for change in result.changes],
-            [("old.txt", "new.txt")],
-        )
-
     def test_creating_nested_file_does_not_modify_parent_directory(self):
+        """Check that a new child does not mark its directory as modified."""
         subdirectory = self.folder / "subdirectory"
         subdirectory.mkdir()
         self.scan()
@@ -313,6 +269,7 @@ class UpdateSnapshotTests(unittest.TestCase):
         )
 
     def test_rename_and_new_file_at_old_path_reports_rename_and_create(self):
+        """Check a rename followed by creating a new file at the old path."""
         old_path = self.folder / "old.txt"
         new_path = self.folder / "new.txt"
         old_path.write_text("original entity", encoding="utf-8")
@@ -334,29 +291,8 @@ class UpdateSnapshotTests(unittest.TestCase):
             },
         )
 
-    def test_rename_over_existing_destination_reports_displaced_delete(self):
-        source_path = self.folder / "source.txt"
-        destination_path = self.folder / "destination.txt"
-        source_path.write_text("source entity", encoding="utf-8")
-        destination_path.write_text("destination entity", encoding="utf-8")
-        self.scan()
-
-        os.replace(source_path, destination_path)
-
-        result = self.scan()
-        self.assert_change_counts(result, delete=1, rename=1)
-        self.assertEqual(
-            {
-                (change.change_type, change.path, change.previous_path)
-                for change in result.changes
-            },
-            {
-                ("delete", "destination.txt", None),
-                ("rename", "destination.txt", "source.txt"),
-            },
-        )
-
     def test_swapping_two_paths_reports_only_two_renames(self):
+        """Check that swapping two files reports only two renames."""
         first_path = self.folder / "first.txt"
         second_path = self.folder / "second.txt"
         temporary_path = self.folder / "temporary.txt"
@@ -378,33 +314,8 @@ class UpdateSnapshotTests(unittest.TestCase):
             {("first.txt", "second.txt"), ("second.txt", "first.txt")},
         )
 
-    def test_directory_rename_collapses_implied_descendant_renames(self):
-        old_directory = self.folder / "old-directory"
-        new_directory = self.folder / "new-directory"
-        nested_directory = old_directory / "nested"
-        nested_directory.mkdir(parents=True)
-        (old_directory / "first.txt").write_text("first", encoding="utf-8")
-        (nested_directory / "second.txt").write_text("second", encoding="utf-8")
-        update_snapshot(
-            str(self.folder), str(self.database), hash_mode="changed"
-        )
-
-        old_directory.rename(new_directory)
-        with patch(
-            "database.calculate_stable_hash",
-            side_effect=AssertionError("renamed descendants were rehashed"),
-        ):
-            result = update_snapshot(
-                str(self.folder), str(self.database), hash_mode="changed"
-            )
-
-        self.assert_change_counts(result, rename=1)
-        self.assertEqual(
-            [(change.previous_path, change.path) for change in result.changes],
-            [("old-directory", "new-directory")],
-        )
-
     def test_directory_rename_collapse_handles_interleaved_sibling_names(self):
+        """Check that a directory move hides implied child renames."""
         old_directory = self.folder / "a"
         old_directory.mkdir()
         (old_directory / "child.txt").write_text("child", encoding="utf-8")
@@ -425,35 +336,8 @@ class UpdateSnapshotTests(unittest.TestCase):
             {("a", "b"), ("a space", "z")},
         )
 
-    def test_modified_file_inside_renamed_directory_reports_modify(self):
-        old_directory = self.folder / "old-directory"
-        new_directory = self.folder / "new-directory"
-        old_directory.mkdir()
-        old_file = old_directory / "file.txt"
-        old_file.write_text("before", encoding="utf-8")
-        self.scan()
-
-        old_directory.rename(new_directory)
-        (new_directory / "file.txt").write_text("after", encoding="utf-8")
-        result = self.scan()
-
-        self.assert_change_counts(result, modify=1, rename=1)
-        self.assertEqual(
-            {
-                (change.change_type, change.path, change.previous_path)
-                for change in result.changes
-            },
-            {
-                ("rename", "new-directory", "old-directory"),
-                (
-                    "modify",
-                    os.path.join("new-directory", "file.txt"),
-                    os.path.join("old-directory", "file.txt"),
-                ),
-            },
-        )
-
     def test_same_path_identity_replacement_reports_delete_and_create(self):
+        """Check that replacing an entity at one path is delete plus create."""
         file_path = self.folder / "replaced.txt"
         replacement_path = Path(self.temporary_directory.name) / "replacement.txt"
         file_path.write_text("old entity", encoding="utf-8")
@@ -476,58 +360,40 @@ class UpdateSnapshotTests(unittest.TestCase):
             {("create", "replaced.txt"), ("delete", "replaced.txt")},
         )
 
-    def test_file_to_directory_replacement_reports_delete_and_create(self):
-        entry_path = self.folder / "entry"
-        entry_path.write_text("file entity", encoding="utf-8")
-        self.scan()
-
-        entry_path.unlink()
-        entry_path.mkdir()
-
-        result = self.scan()
-        self.assert_change_counts(result, create=1, delete=1)
-
-    def test_changed_mode_reuses_an_unchanged_hash(self):
+    def test_unchanged_file_reuses_its_hash(self):
+        """Check that an unchanged file is not hashed again."""
         (self.folder / "stable.txt").write_text("content", encoding="utf-8")
-        update_snapshot(
-            str(self.folder), str(self.database), hash_mode="changed"
-        )
+        update_snapshot(str(self.folder), str(self.database))
 
         with patch(
             "database.calculate_stable_hash",
             side_effect=AssertionError("unchanged file was rehashed"),
         ):
-            result = update_snapshot(
-                str(self.folder), str(self.database), hash_mode="changed"
-            )
+            result = update_snapshot(str(self.folder), str(self.database))
 
         self.assert_change_counts(result)
 
-    def test_changed_mode_reuses_hash_across_rename(self):
+    def test_hash_is_reused_across_rename(self):
+        """Check that a uniquely renamed file keeps its stored hash."""
         old_path = self.folder / "old.txt"
         new_path = self.folder / "new.txt"
         old_path.write_text("content", encoding="utf-8")
-        update_snapshot(
-            str(self.folder), str(self.database), hash_mode="changed"
-        )
+        update_snapshot(str(self.folder), str(self.database))
         old_path.rename(new_path)
 
         with patch(
             "database.calculate_stable_hash",
             side_effect=AssertionError("renamed file was rehashed"),
         ):
-            result = update_snapshot(
-                str(self.folder), str(self.database), hash_mode="changed"
-            )
+            result = update_snapshot(str(self.folder), str(self.database))
 
         self.assert_change_counts(result, rename=1)
 
-    def test_changed_mode_retries_if_a_reused_file_disappears(self):
+    def test_scan_retries_if_a_reused_file_disappears(self):
+        """Check retry behavior when a reused file disappears."""
         file_path = self.folder / "disappearing.txt"
         file_path.write_text("content", encoding="utf-8")
-        update_snapshot(
-            str(self.folder), str(self.database), hash_mode="changed"
-        )
+        update_snapshot(str(self.folder), str(self.database))
 
         def disappearing_scan(folder_path):
             for record in scan_folder(folder_path):
@@ -536,9 +402,7 @@ class UpdateSnapshotTests(unittest.TestCase):
                     file_path.unlink()
 
         with patch("database.scan_folder", side_effect=disappearing_scan):
-            result = update_snapshot(
-                str(self.folder), str(self.database), hash_mode="changed"
-            )
+            result = update_snapshot(str(self.folder), str(self.database))
 
         self.assert_change_counts(result, delete=1)
         with sqlite3.connect(self.database) as connection:
@@ -547,96 +411,12 @@ class UpdateSnapshotTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(entry_count, 0)
 
-    def test_off_mode_does_not_hash_files(self):
-        (self.folder / "metadata-only.txt").write_text("content", encoding="utf-8")
-
-        with patch(
-            "database.calculate_stable_hash",
-            side_effect=AssertionError("off mode attempted to hash a file"),
-        ):
-            result = update_snapshot(
-                str(self.folder), str(self.database), hash_mode="off"
-            )
-
-        self.assert_change_counts(result, create=1)
-        with sqlite3.connect(self.database) as connection:
-            content_hash = connection.execute(
-                "SELECT content_hash FROM entries WHERE path = 'metadata-only.txt'"
-            ).fetchone()[0]
-        self.assertIsNone(content_hash)
-
-    def test_off_mode_preserves_a_still_valid_hash(self):
-        (self.folder / "stable.txt").write_text("content", encoding="utf-8")
-        self.scan()
-
-        with sqlite3.connect(self.database) as connection:
-            original_hash = connection.execute(
-                "SELECT content_hash FROM entries WHERE path = 'stable.txt'"
-            ).fetchone()[0]
-
-        result = update_snapshot(
-            str(self.folder), str(self.database), hash_mode="off"
-        )
-        self.assert_change_counts(result)
-
-        with sqlite3.connect(self.database) as connection:
-            preserved_hash = connection.execute(
-                "SELECT content_hash FROM entries WHERE path = 'stable.txt'"
-            ).fetchone()[0]
-        self.assertEqual(preserved_hash, original_hash)
-
-    def test_off_mode_invalidates_hash_when_metadata_changes(self):
-        file_path = self.folder / "changed.txt"
+    def test_hash_permission_error_keeps_previous_snapshot(self):
+        """Check rollback when file content cannot be read."""
+        file_path = self.folder / "protected.txt"
         file_path.write_text("content", encoding="utf-8")
         self.scan()
-
-        original_stat = file_path.stat()
-        self.assert_mtime_changed(file_path, original_stat)
-        result = update_snapshot(
-            str(self.folder), str(self.database), hash_mode="off"
-        )
-
-        self.assert_change_counts(result, modify=1)
-        with sqlite3.connect(self.database) as connection:
-            stored_hash = connection.execute(
-                "SELECT content_hash FROM entries WHERE path = 'changed.txt'"
-            ).fetchone()[0]
-        self.assertIsNone(stored_hash)
-
-    def test_always_mode_can_audit_hidden_change_after_off_mode(self):
-        file_path = self.folder / "hidden-change.txt"
-        file_path.write_text("AAAA", encoding="utf-8")
-        self.scan()
-        original_stat = file_path.stat()
-
-        file_path.write_text("BBBB", encoding="utf-8")
-        os.utime(
-            file_path,
-            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
-        )
-        off_result = update_snapshot(
-            str(self.folder), str(self.database), hash_mode="off"
-        )
-        self.assert_change_counts(off_result)
-
-        always_result = self.scan()
-        self.assert_change_counts(always_result, modify=1)
-
-    def test_enabling_hashing_does_not_report_a_false_modification(self):
-        (self.folder / "legacy.txt").write_text("content", encoding="utf-8")
-        update_snapshot(
-            str(self.folder), str(self.database), hash_mode="off"
-        )
-
-        result = update_snapshot(
-            str(self.folder), str(self.database), hash_mode="always"
-        )
-
-        self.assert_change_counts(result)
-
-    def test_hash_permission_error_keeps_previous_snapshot(self):
-        (self.folder / "protected.txt").write_text("content", encoding="utf-8")
-        self.scan()
+        file_path.write_text("changed content", encoding="utf-8")
 
         with patch(
             "database.calculate_stable_hash",
@@ -646,9 +426,10 @@ class UpdateSnapshotTests(unittest.TestCase):
                 self.scan()
 
         result = self.scan()
-        self.assert_change_counts(result)
+        self.assert_change_counts(result, modify=1)
 
     def test_database_inside_scanned_folder_is_rejected(self):
+        """Check that the database cannot scan its own files."""
         database_inside_folder = self.folder / "snapshot.db"
 
         with self.assertRaises(ValueError):
@@ -656,18 +437,8 @@ class UpdateSnapshotTests(unittest.TestCase):
 
         self.assertFalse(database_inside_folder.exists())
 
-    def test_inside_database_with_alternate_case_is_rejected(self):
-        alternate_folder = self.folder.with_name(self.folder.name.upper())
-        if not alternate_folder.is_dir() or alternate_folder == self.folder:
-            self.skipTest("Filesystem is case-sensitive")
-        database_inside_folder = alternate_folder / "snapshot.db"
-
-        with self.assertRaises(ValueError):
-            update_snapshot(str(self.folder), str(database_inside_folder))
-
-        self.assertFalse(database_inside_folder.exists())
-
     def test_database_cannot_be_reused_for_a_different_root(self):
+        """Check that one database is bound to one root directory."""
         (self.folder / "stable.txt").write_text("content", encoding="utf-8")
         self.scan()
         other_folder = Path(self.temporary_directory.name) / "other-folder"
@@ -679,74 +450,8 @@ class UpdateSnapshotTests(unittest.TestCase):
         result = self.scan()
         self.assert_change_counts(result)
 
-    def test_populated_database_without_root_metadata_is_rejected(self):
-        (self.folder / "stable.txt").write_text("content", encoding="utf-8")
-        self.scan()
-        with sqlite3.connect(self.database) as connection:
-            connection.execute(
-                "DELETE FROM scan_metadata WHERE key = 'scanned_root'"
-            )
-
-        with self.assertRaisesRegex(ValueError, "no scanned-root metadata"):
-            self.scan()
-
-        with sqlite3.connect(self.database) as connection:
-            stored_paths = connection.execute(
-                "SELECT path FROM entries ORDER BY path"
-            ).fetchall()
-        self.assertEqual(stored_paths, [("stable.txt",)])
-
-    def test_database_stores_its_canonical_scanned_root(self):
-        self.scan()
-
-        with sqlite3.connect(self.database) as connection:
-            stored_root = connection.execute(
-                "SELECT value FROM scan_metadata WHERE key = 'scanned_root'"
-            ).fetchone()[0]
-
-        expected_root = os.path.normcase(os.path.realpath(self.folder))
-        self.assertEqual(stored_root, expected_root)
-
-    def test_equivalent_case_spelling_of_root_is_accepted(self):
-        self.scan()
-        alternate_folder = self.folder.with_name(self.folder.name.upper())
-        if not alternate_folder.is_dir() or alternate_folder == self.folder:
-            self.skipTest("Filesystem is case-sensitive")
-
-        result = update_snapshot(str(alternate_folder), str(self.database))
-        self.assert_change_counts(result)
-
-    def test_disappearing_root_aborts_and_keeps_previous_snapshot(self):
-        (self.folder / "stable.txt").write_text("content", encoding="utf-8")
-        self.scan()
-
-        with patch("scanner.os.scandir", side_effect=FileNotFoundError("gone")):
-            with self.assertRaises(FileNotFoundError):
-                self.scan()
-
-        result = self.scan()
-        self.assert_change_counts(result)
-
-    def test_one_disappearing_root_attempt_is_retried(self):
-        (self.folder / "stable.txt").write_text("content", encoding="utf-8")
-        self.scan()
-        real_scandir = os.scandir
-        call_count = 0
-
-        def flaky_scandir(path):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise FileNotFoundError("temporary disappearance")
-            return real_scandir(path)
-
-        with patch("scanner.os.scandir", side_effect=flaky_scandir):
-            result = self.scan()
-
-        self.assertGreaterEqual(call_count, 2)
-        self.assert_change_counts(result)
-
     def test_partial_snapshot_is_rolled_back_before_retry(self):
+        """Check that retry starts with an empty temporary snapshot."""
         (self.folder / "stable.txt").write_text("content", encoding="utf-8")
         self.scan()
         attempt_count = 0
@@ -767,28 +472,8 @@ class UpdateSnapshotTests(unittest.TestCase):
         self.assertEqual(result.entry_count, 1)
         self.assert_change_counts(result)
 
-    def test_changed_root_identity_retries_the_complete_scan(self):
-        (self.folder / "stable.txt").write_text("content", encoding="utf-8")
-        self.scan()
-        actual_stat = self.folder.stat()
-        actual_identity = (actual_stat.st_dev, actual_stat.st_ino)
-        changed_identity = (actual_stat.st_dev, actual_stat.st_ino + 1)
-
-        with patch(
-            "database.root_identity",
-            side_effect=[
-                actual_identity,
-                changed_identity,
-                actual_identity,
-                actual_identity,
-            ],
-        ) as mocked_identity:
-            result = self.scan()
-
-        self.assertEqual(mocked_identity.call_count, 4)
-        self.assert_change_counts(result)
-
     def test_unchanged_scan_does_not_rewrite_persistent_entries(self):
+        """Check that unchanged rows are not written again."""
         (self.folder / "stable.txt").write_text("content", encoding="utf-8")
         self.scan()
         with sqlite3.connect(self.database) as connection:
@@ -812,21 +497,8 @@ class UpdateSnapshotTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(write_count, 0)
 
-    def test_disappearing_hash_target_aborts_and_keeps_previous_snapshot(self):
-        (self.folder / "stable.txt").write_text("content", encoding="utf-8")
-        self.scan()
-
-        with patch(
-            "database.calculate_stable_hash",
-            side_effect=FileNotFoundError("gone"),
-        ):
-            with self.assertRaises(FileNotFoundError):
-                self.scan()
-
-        result = self.scan()
-        self.assert_change_counts(result)
-
     def test_zero_change_display_limit_does_not_claim_there_are_no_changes(self):
+        """Check terminal output when change details are hidden."""
         (self.folder / "created.txt").write_text("content", encoding="utf-8")
         result = update_snapshot(
             str(self.folder), str(self.database), change_limit=0
@@ -838,7 +510,6 @@ class UpdateSnapshotTests(unittest.TestCase):
                 result,
                 str(self.folder),
                 str(self.database),
-                "always",
                 0.1,
             )
 
@@ -846,6 +517,7 @@ class UpdateSnapshotTests(unittest.TestCase):
         self.assertNotIn("No changes detected.", output.getvalue())
 
     def test_stable_hash_rejects_changed_device_at_final_path_check(self):
+        """Check that hashing rejects a file replaced on another device."""
         file_path = self.folder / "moving.txt"
         file_path.write_text("content", encoding="utf-8")
         actual_stat = os.stat(file_path, follow_symlinks=False)

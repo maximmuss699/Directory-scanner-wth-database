@@ -4,11 +4,7 @@ import stat as stat_module
 from typing import Tuple
 
 from changes import build_entity_matches, detect_changes
-from hashing import (
-    HASH_MODES,
-    FileChangedDuringHashingError,
-    calculate_stable_hash,
-)
+from hashing import FileChangedDuringHashingError, calculate_stable_hash
 from models import Change, ScanResult
 from scanner import scan_folder
 
@@ -215,19 +211,15 @@ def reuse_snapshot_hashes(connection: sqlite3.Connection) -> None:
     connection.execute("DROP TABLE reusable_hashes")
 
 
-def validate_unhashed_files(
-    connection: sqlite3.Connection,
-    folder_path: str,
-    validate_all_files: bool,
+def validate_reused_files(
+    connection: sqlite3.Connection, folder_path: str
 ) -> None:
-    """Check files that were not hashed."""
+    """Check files whose old hashes were reused."""
     query = """
         SELECT path, size, modified_ns, device_id, file_id
         FROM entries_snapshot
-        WHERE entry_type = 'file'
+        WHERE entry_type = 'file' AND content_hash IS NOT NULL
     """
-    if not validate_all_files:
-        query += " AND content_hash IS NOT NULL"
 
     for relative_path, size, modified_ns, device_id, file_id in connection.execute(
         query
@@ -246,20 +238,10 @@ def validate_unhashed_files(
             )
 
 
-def hash_snapshot_files(
-    connection: sqlite3.Connection, folder_path: str, hash_mode: str
-) -> None:
-    """Hash files in the new snapshot."""
-    if hash_mode in ("changed", "off"):
-        reuse_snapshot_hashes(connection)
-        validate_unhashed_files(
-            connection,
-            folder_path,
-            validate_all_files=hash_mode == "off",
-        )
-
-    if hash_mode == "off":
-        return
+def hash_snapshot_files(connection: sqlite3.Connection, folder_path: str) -> None:
+    """Reuse stable hashes and hash the remaining files."""
+    reuse_snapshot_hashes(connection)
+    validate_reused_files(connection, folder_path)
 
     connection.execute(
         """
@@ -268,22 +250,13 @@ def hash_snapshot_files(
         ) WITHOUT ROWID
         """
     )
-    if hash_mode == "always":
-        connection.execute(
-            """
-            INSERT INTO files_to_hash (path)
-            SELECT path FROM entries_snapshot
-            WHERE entry_type = 'file'
-            """
-        )
-    else:
-        connection.execute(
-            """
-            INSERT INTO files_to_hash (path)
-            SELECT path FROM entries_snapshot
-            WHERE entry_type = 'file' AND content_hash IS NULL
-            """
-        )
+    connection.execute(
+        """
+        INSERT INTO files_to_hash (path)
+        SELECT path FROM entries_snapshot
+        WHERE entry_type = 'file' AND content_hash IS NULL
+        """
+    )
 
     for (relative_path,) in connection.execute("SELECT path FROM files_to_hash"):
         file_path = os.path.join(folder_path, relative_path)
@@ -308,7 +281,7 @@ def hash_snapshot_files(
     connection.execute("DROP TABLE files_to_hash")
 
 
-def load_snapshot(connection: sqlite3.Connection, folder_path: str, hash_mode: str) -> int:
+def load_snapshot(connection: sqlite3.Connection, folder_path: str) -> int:
     """Scan the folder into a new snapshot."""
     connection.executemany(
         """
@@ -325,7 +298,7 @@ def load_snapshot(connection: sqlite3.Connection, folder_path: str, hash_mode: s
         ON entries_snapshot(device_id, file_id)
         """
     )
-    hash_snapshot_files(connection, folder_path, hash_mode)
+    hash_snapshot_files(connection, folder_path)
     build_entity_matches(connection)
     return connection.execute(
         "SELECT COUNT(*) FROM entries_snapshot"
@@ -387,14 +360,13 @@ def synchronize_current_entries(connection: sqlite3.Connection) -> None:
 def load_stable_snapshot(
     connection: sqlite3.Connection,
     folder_path: str,
-    hash_mode: str,
 ) -> int:
     """Load a stable snapshot with one retry."""
     for attempt in range(SCAN_ATTEMPTS):
         connection.execute("SAVEPOINT scan_attempt")
         try:
             identity_before = root_identity(folder_path)
-            entry_count = load_snapshot(connection, folder_path, hash_mode)
+            entry_count = load_snapshot(connection, folder_path)
             identity_after = root_identity(folder_path)
             if identity_before != identity_after:
                 raise FileChangedDuringHashingError(
@@ -416,7 +388,6 @@ def update_snapshot(
     folder_path: str,
     database_path: str,
     change_limit: int = 20,
-    hash_mode: str = "always",
 ) -> ScanResult:
     """Scan a folder and update its snapshot."""
     # 1. Prepare and check input.
@@ -427,8 +398,6 @@ def update_snapshot(
         raise ValueError(f"Directory does not exist: {folder_path}")
     if change_limit < 0:
         raise ValueError("Change limit cannot be negative")
-    if hash_mode not in HASH_MODES:
-        raise ValueError(f"Unknown hash mode: {hash_mode}")
 
     # 2. Keep the database outside the scanned folder.
     scanned_root = canonical_path(folder_path)
@@ -443,10 +412,10 @@ def update_snapshot(
         prepare_tables(connection, scanned_root)
 
         # 4. Load a stable snapshot.
-        entry_count = load_stable_snapshot(connection, folder_path, hash_mode)
+        entry_count = load_stable_snapshot(connection, folder_path)
 
         # 5. Detect changes and load a short result list.
-        change_counts = detect_changes(connection, hash_mode != "off")
+        change_counts = detect_changes(connection)
         change_rows = connection.execute(
             """
             SELECT change_type, path, previous_path

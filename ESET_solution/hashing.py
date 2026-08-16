@@ -6,7 +6,6 @@ from typing import Tuple
 HASH_CHUNK_SIZE = 1024 * 1024
 HASH_DIGEST_SIZE = 32
 HASH_ATTEMPTS = 2
-HASH_MODES = ("always", "changed", "off")
 
 
 class FileChangedDuringHashingError(RuntimeError):

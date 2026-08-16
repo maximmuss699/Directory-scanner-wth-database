@@ -3,7 +3,6 @@ import os
 import time
 
 from database import update_snapshot
-from hashing import HASH_MODES
 from models import ScanResult
 
 
@@ -38,13 +37,6 @@ def parse_arguments() -> argparse.Namespace:
         metavar="N",
         help="show at most N detected changes (default: 20)",
     )
-    # We have three hashing modes: always, changed, and off. The default is always.
-    parser.add_argument(
-        "--hash-mode",
-        choices=HASH_MODES,
-        default="always",
-        help="content hashing strategy (default: always)",
-    )
     return parser.parse_args()
 
 
@@ -52,7 +44,6 @@ def print_result(
     result: ScanResult,
     folder_path: str,
     database_path: str,
-    hash_mode: str,
     elapsed_seconds: float,
 ) -> None:
     total_changes = sum(result.change_counts.values())
@@ -61,7 +52,6 @@ def print_result(
     print("=" * 26)
     print(f"Folder   : {os.path.abspath(folder_path)}")
     print(f"Database : {os.path.abspath(database_path)}")
-    print(f"Hashing  : {hash_mode}")
     print(f"Duration : {elapsed_seconds:.2f} s")
     print(f"Entries  : {result.entry_count:,}")
 
@@ -97,13 +87,11 @@ def run() -> None:
         arguments.folder,
         arguments.database,
         arguments.show_changes,
-        arguments.hash_mode,
     )
     elapsed_seconds = time.perf_counter() - started_at
     print_result(
         result,
         arguments.folder,
         arguments.database,
-        arguments.hash_mode,
         elapsed_seconds,
     )
