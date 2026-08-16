@@ -27,14 +27,15 @@ def same_file_state(first: os.stat_result, second: os.stat_result) -> bool:
 
 def calculate_stable_hash(file_path: str) -> Tuple[bytes, os.stat_result]:
     """Hash a file only when its identity and metadata stay stable."""
-    # Retry once if the file changes during hashing.
+    # 1. Retry once if the file changes.
     for attempt in range(HASH_ATTEMPTS):
         try:
+            # 2. Check the path before opening the file.
             path_before = os.stat(file_path, follow_symlinks=False)
             if not stat_module.S_ISREG(path_before.st_mode):
                 continue
 
-            # Open the file and hash its contents using chunks.
+            # 3. Open the file and hash it in chunks.
             with open(file_path, "rb") as file:
                 descriptor_before = os.fstat(file.fileno())
                 if not stat_module.S_ISREG(descriptor_before.st_mode):
@@ -47,16 +48,17 @@ def calculate_stable_hash(file_path: str) -> Tuple[bytes, os.stat_result]:
                         break
                     digest.update(chunk)
 
-                # Recheck the open file after all bytes have been read.
+                # 4. Check the open file after reading it.
                 descriptor_after = os.fstat(file.fileno())
 
-            # Confirm that the path still points to the file we just read.
+            # 5. Check that the path still points to the same file.
             path_after = os.stat(file_path, follow_symlinks=False)
         except (FileNotFoundError, IsADirectoryError):
             if attempt + 1 == HASH_ATTEMPTS:
                 raise
             continue
 
+        # 6. Return the hash only when every state matches.
         if (
             same_file_state(path_before, descriptor_before)
             and same_file_state(descriptor_before, descriptor_after)

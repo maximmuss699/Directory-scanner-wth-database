@@ -27,22 +27,26 @@ def is_directory_junction(entry: os.DirEntry, entry_stat: os.stat_result) -> boo
 
 
 def scan_folder(root_path: str) -> Iterator[EntryRecord]:
-    # LIFO stack of directories. Start with the root directory to scan.
+    """Scan a directory tree and yield one record for each entry."""
+    # 1. Start with the root directory.
     directories_to_scan = [root_path]
     root_stat = os.stat(root_path)
     visited_directories = set()
+
+    # Avoid scanning the same directory twice, which can happen with junctions and hard links.
     if root_stat.st_ino != 0:
         visited_directories.add((root_stat.st_dev, root_stat.st_ino))
 
     while directories_to_scan:
+        # 2. Take the next directory from the stack.
         current_directory = directories_to_scan.pop()
 
-        # A disappearing directory aborts this attempt so it can be retried.
+        # 3. Read all entries in the directory.
         with os.scandir(current_directory) as entries:
             for entry in entries:
                 entry_path = entry.path
 
-                # Do not silently skip an entry that vanishes during the scan.
+                # 4. Read metadata and find the entry type.
                 entry_stat = os.stat(entry_path, follow_symlinks=False)
 
                 if is_directory_junction(entry, entry_stat):
@@ -59,7 +63,7 @@ def scan_folder(root_path: str) -> Iterator[EntryRecord]:
 
                 relative_path = os.path.relpath(entry_path, root_path)
 
-                # Hashing is handled after metadata has been staged in SQLite.
+                # 5. Send the entry metadata to SQLite.
                 yield (
                     relative_path,
                     os.path.dirname(relative_path),
@@ -72,7 +76,7 @@ def scan_folder(root_path: str) -> Iterator[EntryRecord]:
                     None,
                 )
 
-                # Add directories to the explicit traversal stack.
+                # 6. Add new directories to the stack.
                 if entry_type == "directory":
                     directory_identity = (entry_stat.st_dev, entry_stat.st_ino)
                     if (

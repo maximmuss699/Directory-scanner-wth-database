@@ -5,6 +5,7 @@ from typing import Dict
 
 def build_entity_matches(connection: sqlite3.Connection) -> None:
     """Match old and new entries."""
+    # 1. Create an empty table for matched entries.
     connection.execute("DROP TABLE IF EXISTS entity_matches")
     connection.execute(
         """
@@ -14,6 +15,7 @@ def build_entity_matches(connection: sqlite3.Connection) -> None:
         ) WITHOUT ROWID
         """
     )
+    # 2. Match entries with one unique filesystem identity.
     connection.execute(
         """
         INSERT INTO entity_matches (previous_path, path)
@@ -39,6 +41,7 @@ def build_entity_matches(connection: sqlite3.Connection) -> None:
         WHERE previous.entry_type = snapshot.entry_type
         """
     )
+    # 3. Match remaining entries that stayed at the same path.
     connection.execute(
         """
         INSERT INTO entity_matches (previous_path, path)
@@ -68,6 +71,7 @@ def build_entity_matches(connection: sqlite3.Connection) -> None:
 
 def insert_reported_renames(connection: sqlite3.Connection) -> None:
     """Add rename changes to the result."""
+    # 1. Load all entries whose paths changed.
     candidates = connection.execute(
         """
         SELECT match.previous_path, match.path, previous.entry_type
@@ -80,6 +84,7 @@ def insert_reported_renames(connection: sqlite3.Connection) -> None:
     directory_mappings = {}
     rows_to_insert = []
 
+    # 2. Skip child renames already covered by a directory rename.
     for previous_path, path, entry_type in candidates:
         implied = False
         ancestor = os.path.dirname(previous_path)
@@ -95,10 +100,12 @@ def insert_reported_renames(connection: sqlite3.Connection) -> None:
         if implied:
             continue
 
+        # 3. Save a rename that must be reported.
         rows_to_insert.append(("rename", path, previous_path))
         if entry_type == "directory":
             directory_mappings[previous_path] = path
 
+        # 4. Insert large results in small batches.
         if len(rows_to_insert) == 1000:
             connection.executemany(
                 """
@@ -110,6 +117,7 @@ def insert_reported_renames(connection: sqlite3.Connection) -> None:
             )
             rows_to_insert.clear()
 
+    # 5. Insert the last incomplete batch.
     if rows_to_insert:
         connection.executemany(
             """
@@ -123,6 +131,7 @@ def insert_reported_renames(connection: sqlite3.Connection) -> None:
 
 def detect_changes(connection: sqlite3.Connection) -> Dict[str, int]:
     """Find changes between two snapshots."""
+    # 1. Create a temporary table for detected changes.
     connection.execute(
         """
         CREATE TEMP TABLE detected_changes (
@@ -132,7 +141,10 @@ def detect_changes(connection: sqlite3.Connection) -> Dict[str, int]:
         )
         """
     )
+    # 2. Add rename changes first.
     insert_reported_renames(connection)
+
+    # 3. New unmatched entries are creates.
     connection.execute(
         """
         INSERT INTO detected_changes (change_type, path)
@@ -144,6 +156,7 @@ def detect_changes(connection: sqlite3.Connection) -> Dict[str, int]:
         )
         """
     )
+    # 4. Old unmatched entries are deletes.
     connection.execute(
         """
         INSERT INTO detected_changes (change_type, path)
@@ -155,6 +168,7 @@ def detect_changes(connection: sqlite3.Connection) -> Dict[str, int]:
         )
         """
     )
+    # 5. Matched files with different content are modifies.
     connection.execute(
         """
         INSERT INTO detected_changes (change_type, path, previous_path)
@@ -177,6 +191,7 @@ def detect_changes(connection: sqlite3.Connection) -> Dict[str, int]:
           END
         """
     )
+    # 6. Add an index for result queries.
     connection.execute(
         """
         CREATE INDEX idx_detected_changes_path
@@ -184,6 +199,7 @@ def detect_changes(connection: sqlite3.Connection) -> Dict[str, int]:
         """
     )
 
+    # 7. Count each change type.
     counts = {"create": 0, "delete": 0, "modify": 0, "rename": 0}
     for change_type, count in connection.execute(
         """
