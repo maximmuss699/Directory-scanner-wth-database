@@ -5,9 +5,34 @@ from typing import Iterator
 from models import EntryRecord
 
 
+WINDOWS_REPARSE_POINT = getattr(
+    stat_module, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+)
+
+
+def is_directory_junction(entry: os.DirEntry, entry_stat: os.stat_result) -> bool:
+    """Return whether a Windows directory entry must not be traversed."""
+    if os.name != "nt":
+        return False
+
+    is_junction = getattr(entry, "is_junction", None)
+    if is_junction is not None and is_junction():
+        return True
+
+    file_attributes = getattr(entry_stat, "st_file_attributes", 0)
+    return (
+        stat_module.S_ISDIR(entry_stat.st_mode)
+        and bool(file_attributes & WINDOWS_REPARSE_POINT)
+    )
+
+
 def scan_folder(root_path: str) -> Iterator[EntryRecord]:
     # LIFO stack of directories. Start with the root directory to scan.
     directories_to_scan = [root_path]
+    root_stat = os.stat(root_path)
+    visited_directories = set()
+    if root_stat.st_ino != 0:
+        visited_directories.add((root_stat.st_dev, root_stat.st_ino))
 
     while directories_to_scan:
         current_directory = directories_to_scan.pop()
@@ -20,7 +45,9 @@ def scan_folder(root_path: str) -> Iterator[EntryRecord]:
                 # Do not silently skip an entry that vanishes during the scan.
                 entry_stat = os.stat(entry_path, follow_symlinks=False)
 
-                if stat_module.S_ISLNK(entry_stat.st_mode):
+                if is_directory_junction(entry, entry_stat):
+                    entry_type = "junction"
+                elif stat_module.S_ISLNK(entry_stat.st_mode):
                     entry_type = "symlink"
                 elif stat_module.S_ISDIR(entry_stat.st_mode):
                     entry_type = "directory"
@@ -40,11 +67,18 @@ def scan_folder(root_path: str) -> Iterator[EntryRecord]:
                     entry_type,
                     entry_stat.st_size,
                     entry_stat.st_mtime_ns,
-                    entry_stat.st_dev,
-                    entry_stat.st_ino,
+                    str(entry_stat.st_dev),
+                    str(entry_stat.st_ino),
                     None,
                 )
 
                 # Add directories to the explicit traversal stack.
                 if entry_type == "directory":
-                    directories_to_scan.append(entry_path)
+                    directory_identity = (entry_stat.st_dev, entry_stat.st_ino)
+                    if (
+                        entry_stat.st_ino == 0
+                        or directory_identity not in visited_directories
+                    ):
+                        if entry_stat.st_ino != 0:
+                            visited_directories.add(directory_identity)
+                        directories_to_scan.append(entry_path)

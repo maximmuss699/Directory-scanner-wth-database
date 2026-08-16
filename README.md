@@ -70,6 +70,9 @@ flowchart TD
 ```
 
 The scanner uses an explicit LIFO stack instead of recursion.
+Symbolic links and Windows junction/reparse directories are stored as entries
+but never traversed. A visited-directory identity set provides an additional
+cycle guard.
 The database update runs in a transaction. An observed filesystem race causes
 one complete retry. If the retry or another operation fails, the previous valid
 snapshot remains unchanged.
@@ -111,11 +114,11 @@ The persistent `entries` table stores:
 | `path` | Path relative to the scanned root |
 | `parent_path` | Relative parent path |
 | `name` | File or directory name |
-| `entry_type` | `file`, `directory`, `symlink`, or another special type |
+| `entry_type` | `file`, `directory`, `symlink`, `junction`, or another type |
 | `size` | Size in bytes |
 | `modified_ns` | Modification time in nanoseconds |
-| `device_id` | Filesystem device identifier |
-| `file_id` | Filesystem entry identifier |
+| `device_id` | Filesystem device identifier stored as decimal text |
+| `file_id` | Filesystem entry identifier stored as decimal text |
 | `content_hash` | BLAKE2b-256 digest for regular files, stored as a BLOB |
 
 `entries_snapshot`, `entity_matches`, and `detected_changes` are temporary
@@ -125,6 +128,9 @@ latest directory state, not a history of changes.
 
 The persistent table is synchronized incrementally. An unchanged scan compares
 all staged rows but does not delete and reinsert all persistent rows.
+Older databases with integer identity columns are migrated transactionally to
+schema version 3. Text storage safely represents Windows file IDs up to 128 bits
+without SQLite integer overflow.
 
 ## Setup and usage
 
@@ -220,7 +226,8 @@ python -m unittest discover -s tests -v
 Tests cover create, delete, content modification, rename collisions and swaps,
 same-path replacement, directory-tree renames, hard-link ambiguity, hash modes,
 restored timestamps, database migration and root binding, incremental writes,
-retry behavior, input validation, stable hashing, and transaction rollback.
+retry behavior, input validation, stable hashing, Windows-sized file IDs,
+junction handling, and transaction rollback.
 
 ## Stable hashing and performance
 

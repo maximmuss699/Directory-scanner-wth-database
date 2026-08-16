@@ -1,70 +1,25 @@
 import os
 import sqlite3
-import stat as stat_module
-from typing import Dict, Tuple
+from typing import Dict
 
-from hashing import (
-    HASH_MODES,
-    FileChangedDuringHashingError,
-    calculate_stable_hash,
-)
+from hashing import HASH_MODES, calculate_stable_hash
 from models import Change, ScanResult
 from scanner import scan_folder
 
 
-SCAN_ATTEMPTS = 2
-SCHEMA_VERSION = "2"
-LEGACY_SCHEMA_VERSIONS = {"1"}
-UNSTABLE_SCAN_ERRORS = (
-    FileNotFoundError,
-    NotADirectoryError,
-    IsADirectoryError,
-    FileChangedDuringHashingError,
-)
-
-
 def canonical_path(path: str) -> str:
-    """Return one comparable spelling of a filesystem path."""
+    """Return a stable path spelling for storing the scanned root."""
     return os.path.normcase(os.path.realpath(os.path.abspath(path)))
 
 
-def path_is_inside(path: str, directory: str) -> bool:
-    try:
-        if os.path.commonpath((path, directory)) == directory:
-            return True
-    except ValueError:
-        return False
-
-    candidate = path if os.path.isdir(path) else os.path.dirname(path)
-    while candidate:
-        try:
-            if os.path.samefile(candidate, directory):
-                return True
-        except OSError:
-            pass
-
-        parent = os.path.dirname(candidate)
-        if parent == candidate:
-            return False
-        candidate = parent
-
-    return False
-
-
 def paths_refer_to_same_location(first: str, second: str) -> bool:
+    """Compare paths while respecting filesystem aliases and case rules."""
     if first == second:
         return True
     try:
         return os.path.samefile(first, second)
     except OSError:
         return False
-
-
-def root_identity(folder_path: str) -> Tuple[int, int]:
-    root_stat = os.stat(folder_path)
-    if not stat_module.S_ISDIR(root_stat.st_mode):
-        raise NotADirectoryError(folder_path)
-    return root_stat.st_dev, root_stat.st_ino
 
 
 def prepare_tables(
@@ -114,6 +69,15 @@ def prepare_tables(
         "SELECT value FROM scan_metadata WHERE key = 'scanned_root'"
     ).fetchone()
     if stored_root_row is None:
+        has_existing_snapshot = connection.execute(
+            "SELECT EXISTS(SELECT 1 FROM entries)"
+        ).fetchone()[0]
+        if has_existing_snapshot:
+            raise ValueError(
+                "Existing database has entries but no scanned-root metadata. "
+                "Use a new database or reset it explicitly."
+            )
+
         connection.execute(
             "INSERT INTO scan_metadata (key, value) VALUES ('scanned_root', ?)",
             (scanned_root,),
@@ -122,25 +86,6 @@ def prepare_tables(
         raise ValueError(
             "Database belongs to a different scanned directory: "
             f"{stored_root_row[0]}"
-        )
-
-    stored_version_row = connection.execute(
-        "SELECT value FROM scan_metadata WHERE key = 'schema_version'"
-    ).fetchone()
-    if stored_version_row is None:
-        connection.execute(
-            "INSERT INTO scan_metadata (key, value) "
-            "VALUES ('schema_version', ?)",
-            (SCHEMA_VERSION,),
-        )
-    elif stored_version_row[0] in LEGACY_SCHEMA_VERSIONS:
-        connection.execute(
-            "UPDATE scan_metadata SET value = ? WHERE key = 'schema_version'",
-            (SCHEMA_VERSION,),
-        )
-    elif stored_version_row[0] != SCHEMA_VERSION:
-        raise ValueError(
-            f"Unsupported database schema version: {stored_version_row[0]}"
         )
 
     # Keep the new scan separate from the previous state during comparison.
@@ -161,126 +106,36 @@ def prepare_tables(
     )
 
 
-def reuse_snapshot_hashes(connection: sqlite3.Connection) -> None:
-    """Copy hashes whose identity and hash-validating metadata still match."""
-    connection.execute(
-        """
-        CREATE TEMP TABLE reusable_hashes (
-            path TEXT PRIMARY KEY,
-            content_hash BLOB NOT NULL
-        ) WITHOUT ROWID
-        """
-    )
-
-    # Exact-path matches also preserve hashes for unchanged hard links.
-    connection.execute(
-        """
-        INSERT INTO reusable_hashes (path, content_hash)
-        SELECT snapshot.path, previous.content_hash
-        FROM entries_snapshot AS snapshot
-        JOIN entries AS previous ON previous.path = snapshot.path
-        WHERE snapshot.entry_type = 'file'
-          AND previous.entry_type = 'file'
-          AND previous.size = snapshot.size
-          AND previous.modified_ns = snapshot.modified_ns
-          AND previous.device_id = snapshot.device_id
-          AND previous.file_id = snapshot.file_id
-          AND previous.content_hash IS NOT NULL
-        """
-    )
-
-    # A unique, non-zero identity allows reuse after a file or directory rename.
-    connection.execute(
-        """
-        INSERT OR IGNORE INTO reusable_hashes (path, content_hash)
-        WITH previous_unique AS (
-            SELECT device_id, file_id, MIN(path) AS path
-            FROM entries
-            WHERE entry_type = 'file'
-              AND file_id != 0
-            GROUP BY device_id, file_id
-            HAVING COUNT(*) = 1
-        ),
-        snapshot_unique AS (
-            SELECT device_id, file_id, MIN(path) AS path
-            FROM entries_snapshot
-            WHERE entry_type = 'file'
-              AND file_id != 0
-            GROUP BY device_id, file_id
-            HAVING COUNT(*) = 1
-        )
-        SELECT snapshot.path, previous.content_hash
-        FROM previous_unique
-        JOIN snapshot_unique USING (device_id, file_id)
-        JOIN entries AS previous ON previous.path = previous_unique.path
-        JOIN entries_snapshot AS snapshot ON snapshot.path = snapshot_unique.path
-        WHERE previous.size = snapshot.size
-          AND previous.modified_ns = snapshot.modified_ns
-          AND previous.content_hash IS NOT NULL
-        """
-    )
-
-    connection.execute(
-        """
-        UPDATE entries_snapshot
-        SET content_hash = (
-            SELECT reusable.content_hash
-            FROM reusable_hashes AS reusable
-            WHERE reusable.path = entries_snapshot.path
-        )
-        WHERE EXISTS (
-            SELECT 1
-            FROM reusable_hashes AS reusable
-            WHERE reusable.path = entries_snapshot.path
-        )
-        """
-    )
-    connection.execute("DROP TABLE reusable_hashes")
-
-
-def validate_unhashed_files(
-    connection: sqlite3.Connection,
-    folder_path: str,
-    validate_all_files: bool,
-) -> None:
-    query = """
-        SELECT path, size, modified_ns, device_id, file_id
-        FROM entries_snapshot
-        WHERE entry_type = 'file'
-    """
-    if not validate_all_files:
-        query += " AND content_hash IS NOT NULL"
-
-    for relative_path, size, modified_ns, device_id, file_id in connection.execute(
-        query
-    ):
-        file_path = os.path.join(folder_path, relative_path)
-        current_stat = os.stat(file_path, follow_symlinks=False)
-        if (
-            not stat_module.S_ISREG(current_stat.st_mode)
-            or current_stat.st_size != size
-            or current_stat.st_mtime_ns != modified_ns
-            or current_stat.st_dev != device_id
-            or current_stat.st_ino != file_id
-        ):
-            raise FileChangedDuringHashingError(
-                f"File changed after it was scanned: {file_path}"
-            )
-
-
 def hash_snapshot_files(
     connection: sqlite3.Connection, folder_path: str, hash_mode: str
 ) -> None:
-    if hash_mode in ("changed", "off"):
-        reuse_snapshot_hashes(connection)
-        validate_unhashed_files(
-            connection,
-            folder_path,
-            validate_all_files=hash_mode == "off",
-        )
-
     if hash_mode == "off":
         return
+
+    if hash_mode == "changed":
+        # Reuse hashes without loading the previous snapshot into Python memory.
+        connection.execute(
+            """
+            UPDATE entries_snapshot
+            SET content_hash = (
+                SELECT previous.content_hash
+                FROM entries AS previous
+                WHERE previous.path = entries_snapshot.path
+            )
+            WHERE entry_type = 'file'
+              AND EXISTS (
+                  SELECT 1
+                  FROM entries AS previous
+                  WHERE previous.path = entries_snapshot.path
+                    AND previous.entry_type = 'file'
+                    AND previous.size = entries_snapshot.size
+                    AND previous.modified_ns = entries_snapshot.modified_ns
+                    AND previous.device_id = entries_snapshot.device_id
+                    AND previous.file_id = entries_snapshot.file_id
+                    AND previous.content_hash IS NOT NULL
+              )
+            """
+        )
 
     connection.execute(
         """
@@ -311,7 +166,15 @@ def hash_snapshot_files(
 
     for (relative_path,) in connection.execute("SELECT path FROM files_to_hash"):
         file_path = os.path.join(folder_path, relative_path)
-        content_hash, entry_stat = calculate_stable_hash(file_path)
+
+        try:
+            content_hash, entry_stat = calculate_stable_hash(file_path)
+        except FileNotFoundError:
+            # The file disappeared after its metadata was staged.
+            connection.execute(
+                "DELETE FROM entries_snapshot WHERE path = ?", (relative_path,)
+            )
+            continue
 
         connection.execute(
             """
@@ -333,74 +196,6 @@ def hash_snapshot_files(
             ),
         )
 
-    connection.execute("DROP TABLE files_to_hash")
-
-
-def build_entity_matches(connection: sqlite3.Connection) -> None:
-    """Build conservative one-to-one matches between old and new entries."""
-    connection.execute("DROP TABLE IF EXISTS entity_matches")
-    connection.execute(
-        """
-        CREATE TEMP TABLE entity_matches (
-            previous_path TEXT PRIMARY KEY,
-            path TEXT NOT NULL UNIQUE,
-            match_kind TEXT NOT NULL
-        ) WITHOUT ROWID
-        """
-    )
-    connection.execute(
-        """
-        INSERT INTO entity_matches (previous_path, path, match_kind)
-        WITH previous_unique AS (
-            SELECT device_id, file_id, MIN(path) AS path
-            FROM entries
-            WHERE file_id != 0
-            GROUP BY device_id, file_id
-            HAVING COUNT(*) = 1
-        ),
-        snapshot_unique AS (
-            SELECT device_id, file_id, MIN(path) AS path
-            FROM entries_snapshot
-            WHERE file_id != 0
-            GROUP BY device_id, file_id
-            HAVING COUNT(*) = 1
-        )
-        SELECT previous.path, snapshot.path, 'identity'
-        FROM previous_unique
-        JOIN snapshot_unique USING (device_id, file_id)
-        JOIN entries AS previous ON previous.path = previous_unique.path
-        JOIN entries_snapshot AS snapshot ON snapshot.path = snapshot_unique.path
-        WHERE previous.entry_type = snapshot.entry_type
-        """
-    )
-    connection.execute(
-        """
-        INSERT INTO entity_matches (previous_path, path, match_kind)
-        SELECT previous.path, snapshot.path, 'path'
-        FROM entries AS previous
-        JOIN entries_snapshot AS snapshot ON snapshot.path = previous.path
-        WHERE previous.entry_type = snapshot.entry_type
-          AND NOT EXISTS (
-              SELECT 1
-              FROM entity_matches AS match
-              WHERE match.previous_path = previous.path
-          )
-          AND NOT EXISTS (
-              SELECT 1
-              FROM entity_matches AS match
-              WHERE match.path = snapshot.path
-          )
-          AND (
-              (
-                  previous.device_id = snapshot.device_id
-                  AND previous.file_id = snapshot.file_id
-              )
-              OR previous.file_id = 0
-              OR snapshot.file_id = 0
-          )
-        """
-    )
-
 
 def load_snapshot(
     connection: sqlite3.Connection, folder_path: str, hash_mode: str
@@ -414,16 +209,13 @@ def load_snapshot(
         """,
         scan_folder(folder_path),
     )
+    hash_snapshot_files(connection, folder_path, hash_mode)
     connection.execute(
         """
         CREATE INDEX idx_entries_snapshot_identity
         ON entries_snapshot(device_id, file_id)
         """
     )
-    hash_snapshot_files(connection, folder_path, hash_mode)
-
-    # Hashing can refresh identity and metadata, so match entities afterward.
-    build_entity_matches(connection)
 
     return connection.execute(
         "SELECT COUNT(*) FROM entries_snapshot"
@@ -442,17 +234,63 @@ def detect_changes(
         )
         """
     )
-    insert_reported_renames(connection)
+    connection.execute(
+        """
+        CREATE INDEX idx_detected_changes_path
+        ON detected_changes(change_type, path)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_detected_changes_previous_path
+        ON detected_changes(change_type, previous_path)
+        """
+    )
+
+    # Hard links make an identity ambiguous, so only unique identities are renames.
+    connection.execute(
+        """
+        INSERT INTO detected_changes (change_type, path, previous_path)
+        WITH previous_identities AS (
+            SELECT device_id, file_id
+            FROM entries
+            GROUP BY device_id, file_id
+            HAVING COUNT(*) = 1
+        ),
+        snapshot_identities AS (
+            SELECT device_id, file_id
+            FROM entries_snapshot
+            GROUP BY device_id, file_id
+            HAVING COUNT(*) = 1
+        )
+        SELECT 'rename', snapshot.path, previous.path
+        FROM entries AS previous
+        JOIN entries_snapshot AS snapshot
+          ON snapshot.device_id = previous.device_id
+         AND snapshot.file_id = previous.file_id
+        JOIN previous_identities
+          ON previous_identities.device_id = previous.device_id
+         AND previous_identities.file_id = previous.file_id
+        JOIN snapshot_identities
+          ON snapshot_identities.device_id = snapshot.device_id
+         AND snapshot_identities.file_id = snapshot.file_id
+        WHERE previous.path != snapshot.path
+          AND previous.entry_type = snapshot.entry_type
+        """
+    )
     connection.execute(
         """
         INSERT INTO detected_changes (change_type, path)
         SELECT 'create', snapshot.path
         FROM entries_snapshot AS snapshot
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM entity_matches AS match
-            WHERE match.path = snapshot.path
-        )
+        LEFT JOIN entries AS previous ON previous.path = snapshot.path
+        WHERE previous.path IS NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM detected_changes AS change
+              WHERE change.change_type = 'rename'
+                AND change.path = snapshot.path
+          )
         """
     )
     connection.execute(
@@ -460,43 +298,56 @@ def detect_changes(
         INSERT INTO detected_changes (change_type, path)
         SELECT 'delete', previous.path
         FROM entries AS previous
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM entity_matches AS match
-            WHERE match.previous_path = previous.path
-        )
+        LEFT JOIN entries_snapshot AS snapshot ON snapshot.path = previous.path
+        WHERE snapshot.path IS NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM detected_changes AS change
+              WHERE change.change_type = 'rename'
+                AND change.previous_path = previous.path
+          )
         """
+    )
+    connection.execute(
+        """
+        INSERT INTO detected_changes (change_type, path)
+        SELECT 'modify', snapshot.path
+        FROM entries_snapshot AS snapshot
+        JOIN entries AS previous ON previous.path = snapshot.path
+        WHERE previous.entry_type != snapshot.entry_type
+           OR previous.size != snapshot.size
+           OR previous.modified_ns != snapshot.modified_ns
+           OR previous.device_id != snapshot.device_id
+           OR previous.file_id != snapshot.file_id
+           OR (
+               ?
+               AND previous.content_hash IS NOT NULL
+               AND snapshot.content_hash IS NOT NULL
+               AND previous.content_hash IS NOT snapshot.content_hash
+           )
+        """,
+        (compare_content_hashes,),
     )
     connection.execute(
         """
         INSERT INTO detected_changes (change_type, path, previous_path)
-        SELECT
-            'modify',
-            snapshot.path,
-            CASE
-                WHEN match.previous_path != match.path THEN match.previous_path
-            END
-        FROM entity_matches AS match
-        JOIN entries AS previous ON previous.path = match.previous_path
-        JOIN entries_snapshot AS snapshot ON snapshot.path = match.path
-        WHERE snapshot.entry_type = 'file'
-          AND CASE
-              WHEN ?
-               AND previous.content_hash IS NOT NULL
-               AND snapshot.content_hash IS NOT NULL
-              THEN previous.content_hash IS NOT snapshot.content_hash
-              ELSE previous.size != snapshot.size
-                OR previous.modified_ns != snapshot.modified_ns
-          END
+        SELECT 'modify', snapshot.path, previous.path
+        FROM detected_changes AS rename
+        JOIN entries AS previous ON previous.path = rename.previous_path
+        JOIN entries_snapshot AS snapshot ON snapshot.path = rename.path
+        WHERE rename.change_type = 'rename'
+          AND (
+              previous.size != snapshot.size
+              OR previous.modified_ns != snapshot.modified_ns
+              OR (
+                  ?
+                  AND previous.content_hash IS NOT NULL
+                  AND snapshot.content_hash IS NOT NULL
+                  AND previous.content_hash IS NOT snapshot.content_hash
+              )
+          )
         """,
         (compare_content_hashes,),
-    )
-
-    connection.execute(
-        """
-        CREATE INDEX idx_detected_changes_path
-        ON detected_changes(change_type, path)
-        """
     )
 
     change_counts = {"create": 0, "delete": 0, "modify": 0, "rename": 0}
@@ -512,117 +363,28 @@ def detect_changes(
     return change_counts
 
 
-def insert_reported_renames(connection: sqlite3.Connection) -> None:
-    """Store renames while collapsing paths implied by a directory rename."""
-    rename_candidates = connection.execute(
-        """
-        SELECT match.previous_path, match.path, previous.entry_type
-        FROM entity_matches AS match
-        JOIN entries AS previous ON previous.path = match.previous_path
-        WHERE match.previous_path != match.path
-        ORDER BY match.previous_path
-        """
-    )
-    directory_mappings = {}
-    rows_to_insert = []
-
-    for previous_path, path, entry_type in rename_candidates:
-        implied_by_directory = False
-        ancestor = os.path.dirname(previous_path)
-        while ancestor:
-            if ancestor in directory_mappings:
-                suffix = previous_path[len(ancestor) :]
-                implied_by_directory = (
-                    path == directory_mappings[ancestor] + suffix
-                )
-                break
-            ancestor = os.path.dirname(ancestor)
-
-        if not implied_by_directory:
-            rows_to_insert.append(("rename", path, previous_path))
-            if len(rows_to_insert) == 1000:
-                connection.executemany(
-                    """
-                    INSERT INTO detected_changes (
-                        change_type, path, previous_path
-                    ) VALUES (?, ?, ?)
-                    """,
-                    rows_to_insert,
-                )
-                rows_to_insert.clear()
-
-            if entry_type == "directory":
-                directory_mappings[previous_path] = path
-
-    if rows_to_insert:
-        connection.executemany(
-            """
-            INSERT INTO detected_changes (change_type, path, previous_path)
-            VALUES (?, ?, ?)
-            """,
-            rows_to_insert,
-        )
-
-
-def synchronize_current_entries(connection: sqlite3.Connection) -> None:
-    """Make the persistent table equal to the snapshot with delta-only writes."""
+def replace_current_entries(connection: sqlite3.Connection) -> None:
+    connection.execute("DELETE FROM entries")
     connection.execute(
         """
-        CREATE TEMP TABLE entries_to_write (
-            path TEXT PRIMARY KEY
-        ) WITHOUT ROWID
-        """
-    )
-    connection.execute(
-        """
-        INSERT INTO entries_to_write (path)
-        SELECT snapshot.path
-        FROM entries_snapshot AS snapshot
-        LEFT JOIN entries AS previous ON previous.path = snapshot.path
-        WHERE previous.path IS NULL
-           OR previous.parent_path IS NOT snapshot.parent_path
-           OR previous.name IS NOT snapshot.name
-           OR previous.entry_type IS NOT snapshot.entry_type
-           OR previous.size IS NOT snapshot.size
-           OR previous.modified_ns IS NOT snapshot.modified_ns
-           OR previous.device_id IS NOT snapshot.device_id
-           OR previous.file_id IS NOT snapshot.file_id
-           OR previous.content_hash IS NOT snapshot.content_hash
-        """
-    )
-    connection.execute(
-        """
-        DELETE FROM entries
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM entries_snapshot AS snapshot
-            WHERE snapshot.path = entries.path
-        )
-        """
-    )
-    connection.execute(
-        """
-        INSERT OR REPLACE INTO entries (
+        INSERT INTO entries (
             path, parent_path, name, entry_type, size, modified_ns,
             device_id, file_id, content_hash
         )
         SELECT
-            snapshot.path, snapshot.parent_path, snapshot.name,
-            snapshot.entry_type, snapshot.size, snapshot.modified_ns,
-            snapshot.device_id, snapshot.file_id, snapshot.content_hash
-        FROM entries_snapshot AS snapshot
-        JOIN entries_to_write AS write ON write.path = snapshot.path
+            path, parent_path, name, entry_type, size, modified_ns,
+            device_id, file_id, content_hash
+        FROM entries_snapshot
         """
     )
-    connection.execute("DROP TABLE entries_to_write")
 
 
 def update_snapshot(
     folder_path: str,
     database_path: str,
     change_limit: int = 20,
-    hash_mode: str = "always",
-) -> ScanResult:
+    hash_mode: str = "always", ) -> ScanResult:
+    
     folder_path = os.path.abspath(folder_path)
     database_path = os.path.abspath(database_path)
 
@@ -634,53 +396,23 @@ def update_snapshot(
         raise ValueError(f"Unknown hash mode: {hash_mode}")
 
     scanned_root = canonical_path(folder_path)
-    canonical_database = canonical_path(database_path)
-    if path_is_inside(canonical_database, scanned_root):
-        raise ValueError("SQLite database must be outside the scanned directory")
-
-    connection = sqlite3.connect(database_path)
-    try:
-        connection.execute("BEGIN IMMEDIATE")
+    with sqlite3.connect(database_path) as connection:
         prepare_tables(connection, scanned_root)
-
-        entry_count = 0
-        for attempt in range(SCAN_ATTEMPTS):
-            connection.execute("SAVEPOINT scan_attempt")
-            try:
-                identity_before = root_identity(folder_path)
-                entry_count = load_snapshot(connection, folder_path, hash_mode)
-                identity_after = root_identity(folder_path)
-                if identity_before != identity_after:
-                    raise FileChangedDuringHashingError(
-                        "Root directory changed while it was being scanned"
-                    )
-            except UNSTABLE_SCAN_ERRORS:
-                connection.execute("ROLLBACK TO scan_attempt")
-                connection.execute("RELEASE scan_attempt")
-                if attempt + 1 == SCAN_ATTEMPTS:
-                    raise
-            else:
-                connection.execute("RELEASE scan_attempt")
-                break
-
+        entry_count = load_snapshot(connection, folder_path, hash_mode)
         change_counts = detect_changes(connection, hash_mode != "off")
+
         change_rows = connection.execute(
             """
             SELECT change_type, path, previous_path
             FROM detected_changes
-            ORDER BY change_type, path, previous_path
+            ORDER BY change_type, path
             LIMIT ?
             """,
             (change_limit,),
         ).fetchall()
         changes = [Change(*row) for row in change_rows]
 
-        synchronize_current_entries(connection)
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+        # This runs in the same transaction as the scan and comparison.
+        replace_current_entries(connection)
 
     return ScanResult(entry_count, change_counts, changes)

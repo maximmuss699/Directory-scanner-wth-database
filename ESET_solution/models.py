@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 
-EntryRecord = Tuple[str, str, str, str, int, int, int, int, Optional[bytes]]
+EntryRecord = Tuple[str, str, str, str, int, int, str, str, Optional[bytes]]
 
 
 @dataclass(frozen=True)

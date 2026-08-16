@@ -1,17 +1,18 @@
 import io
 import os
 import sqlite3
+import stat as stat_module
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from cli import print_result
 from database import update_snapshot
 from hashing import FileChangedDuringHashingError, calculate_stable_hash
-from scanner import scan_folder
+from scanner import is_directory_junction, scan_folder
 
 
 class UpdateSnapshotTests(unittest.TestCase):
@@ -105,6 +106,119 @@ class UpdateSnapshotTests(unittest.TestCase):
                 (os.path.join("subdirectory", "back-to-root"),),
             ).fetchone()[0]
         self.assertEqual(entry_type, "symlink")
+
+    def test_scanner_serializes_filesystem_identity_as_text(self):
+        (self.folder / "identity.txt").write_text("content", encoding="utf-8")
+
+        record = next(scan_folder(str(self.folder)))
+
+        self.assertIsInstance(record[6], str)
+        self.assertIsInstance(record[7], str)
+
+    def test_large_windows_file_identity_is_stored_without_overflow(self):
+        directory_path = self.folder / "large-identity"
+        directory_path.mkdir()
+        directory_stat = directory_path.stat()
+        large_device_id = str(2**80 + 123)
+        large_file_id = str(2**127 + 456)
+        staged_record = (
+            "large-identity",
+            "",
+            "large-identity",
+            "directory",
+            directory_stat.st_size,
+            directory_stat.st_mtime_ns,
+            large_device_id,
+            large_file_id,
+            None,
+        )
+
+        with patch("database.scan_folder", return_value=iter([staged_record])):
+            initial_result = update_snapshot(
+                str(self.folder), str(self.database), hash_mode="off"
+            )
+
+        self.assert_change_counts(initial_result, create=1)
+        renamed_path = self.folder / "renamed-large-identity"
+        directory_path.rename(renamed_path)
+        renamed_record = (
+            "renamed-large-identity",
+            "",
+            "renamed-large-identity",
+            "directory",
+            directory_stat.st_size,
+            directory_stat.st_mtime_ns,
+            large_device_id,
+            large_file_id,
+            None,
+        )
+        with patch("database.scan_folder", return_value=iter([renamed_record])):
+            rename_result = update_snapshot(
+                str(self.folder), str(self.database), hash_mode="off"
+            )
+
+        self.assert_change_counts(rename_result, rename=1)
+        self.assertEqual(
+            (
+                rename_result.changes[0].previous_path,
+                rename_result.changes[0].path,
+            ),
+            ("large-identity", "renamed-large-identity"),
+        )
+        with sqlite3.connect(self.database) as connection:
+            stored = connection.execute(
+                """
+                SELECT device_id, file_id, typeof(device_id), typeof(file_id)
+                FROM entries
+                WHERE path = 'renamed-large-identity'
+                """
+            ).fetchone()
+        self.assertEqual(
+            stored,
+            (large_device_id, large_file_id, "text", "text"),
+        )
+
+    def test_windows_junction_is_stored_without_being_traversed(self):
+        root_stat = SimpleNamespace(st_dev=1, st_ino=10)
+        junction_stat = SimpleNamespace(
+            st_mode=stat_module.S_IFDIR | 0o755,
+            st_size=0,
+            st_mtime_ns=1,
+            st_dev=1,
+            st_ino=20,
+            st_file_attributes=0x400,
+        )
+        junction_entry = SimpleNamespace(
+            path=os.path.join(str(self.folder), "junction"),
+            name="junction",
+            is_junction=lambda: True,
+        )
+        scandir_context = MagicMock()
+        scandir_context.__enter__.return_value = iter([junction_entry])
+        scandir_context.__exit__.return_value = False
+
+        with patch("scanner.os.name", "nt"):
+            with patch(
+                "scanner.os.stat", side_effect=[root_stat, junction_stat]
+            ):
+                with patch(
+                    "scanner.os.scandir", return_value=scandir_context
+                ) as scandir:
+                    records = list(scan_folder(str(self.folder)))
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0][3], "junction")
+        scandir.assert_called_once_with(str(self.folder))
+
+    def test_windows_reparse_attribute_fallback_detects_junction(self):
+        entry = SimpleNamespace()
+        junction_stat = SimpleNamespace(
+            st_mode=stat_module.S_IFDIR | 0o755,
+            st_file_attributes=0x400,
+        )
+
+        with patch("scanner.os.name", "nt"):
+            self.assertTrue(is_directory_junction(entry, junction_stat))
 
     def test_rename_and_content_change_reports_both_changes(self):
         old_path = self.folder / "old.txt"
@@ -530,13 +644,28 @@ class UpdateSnapshotTests(unittest.TestCase):
 
         with sqlite3.connect(self.database) as connection:
             columns = {
-                row[1] for row in connection.execute("PRAGMA table_info(entries)")
+                row[1]: row[2]
+                for row in connection.execute("PRAGMA table_info(entries)")
             }
             stored_hash = connection.execute(
                 "SELECT content_hash FROM entries WHERE path = 'new.txt'"
             ).fetchone()[0]
+            identity_storage = connection.execute(
+                """
+                SELECT typeof(device_id), typeof(file_id)
+                FROM entries
+                WHERE path = 'new.txt'
+                """
+            ).fetchone()
+            schema_version = connection.execute(
+                "SELECT value FROM scan_metadata WHERE key = 'schema_version'"
+            ).fetchone()[0]
 
         self.assertIn("content_hash", columns)
+        self.assertEqual(columns["device_id"], "TEXT")
+        self.assertEqual(columns["file_id"], "TEXT")
+        self.assertEqual(identity_storage, ("text", "text"))
+        self.assertEqual(schema_version, "3")
         self.assertEqual(len(stored_hash), 32)
 
     def test_populated_metadata_only_database_migrates_without_false_change(self):
@@ -572,6 +701,19 @@ class UpdateSnapshotTests(unittest.TestCase):
                     file_stat.st_dev,
                     file_stat.st_ino,
                 ),
+            )
+            connection.execute(
+                """
+                CREATE TABLE scan_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                ) WITHOUT ROWID
+                """
+            )
+            connection.execute(
+                "INSERT INTO scan_metadata (key, value) "
+                "VALUES ('scanned_root', ?)",
+                (os.path.normcase(os.path.realpath(self.folder)),),
             )
 
         result = self.scan()
@@ -639,6 +781,23 @@ class UpdateSnapshotTests(unittest.TestCase):
 
         result = self.scan()
         self.assert_change_counts(result)
+
+    def test_populated_database_without_root_metadata_is_rejected(self):
+        (self.folder / "stable.txt").write_text("content", encoding="utf-8")
+        self.scan()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "DELETE FROM scan_metadata WHERE key = 'scanned_root'"
+            )
+
+        with self.assertRaisesRegex(ValueError, "no scanned-root metadata"):
+            self.scan()
+
+        with sqlite3.connect(self.database) as connection:
+            stored_paths = connection.execute(
+                "SELECT path FROM entries ORDER BY path"
+            ).fetchall()
+        self.assertEqual(stored_paths, [("stable.txt",)])
 
     def test_database_stores_its_canonical_scanned_root(self):
         self.scan()
