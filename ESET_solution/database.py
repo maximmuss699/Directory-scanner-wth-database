@@ -211,9 +211,7 @@ def reuse_snapshot_hashes(connection: sqlite3.Connection) -> None:
     connection.execute("DROP TABLE reusable_hashes")
 
 
-def validate_reused_files(
-    connection: sqlite3.Connection, folder_path: str
-) -> None:
+def validate_reused_files(connection: sqlite3.Connection, folder_path: str) -> None:
     """Check files whose old hashes were reused."""
     query = """
         SELECT path, size, modified_ns, device_id, file_id
@@ -357,10 +355,7 @@ def synchronize_current_entries(connection: sqlite3.Connection) -> None:
     connection.execute("DROP TABLE entries_to_write")
 
 
-def load_stable_snapshot(
-    connection: sqlite3.Connection,
-    folder_path: str,
-) -> int:
+def load_stable_snapshot(connection: sqlite3.Connection,folder_path: str,) -> int:
     """Load a stable snapshot with one retry."""
     for attempt in range(SCAN_ATTEMPTS):
         connection.execute("SAVEPOINT scan_attempt")

@@ -70,6 +70,20 @@ The database update runs in a transaction. An observed filesystem race causes
 one complete retry. If the retry or another operation fails, the previous valid
 snapshot remains unchanged.
 
+## Algorithms
+
+- **Directory scan:** iterative depth-first traversal with `os.scandir()` and a
+  LIFO stack, without Python recursion.
+- **Cycle protection:** visited directory identities prevent repeated traversal;
+  symbolic links and Windows junctions are not followed.
+- **Content hashing:** BLAKE2b reads files in 1 MiB chunks and uses constant
+  memory. Valid hashes of unchanged files are reused.
+- **Entity matching:** unique `(device_id, file_id)` pairs identify renames;
+  ambiguous hard links are handled conservatively.
+- **Change detection:** set-based SQLite queries find create, delete, modify,
+  and rename events.
+- **Snapshot update:** only changed persistent rows are deleted or replaced.
+
 ## Change detection
 
 ```mermaid
