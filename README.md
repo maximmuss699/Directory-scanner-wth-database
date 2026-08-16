@@ -33,7 +33,8 @@ ESET_solution/
 ├── cli.py        # Arguments and terminal output
 ├── scanner.py    # Iterative filesystem traversal
 ├── hashing.py    # Stable BLAKE2b content hashing
-├── database.py   # SQLite snapshots and change detection
+├── database.py   # SQLite snapshots and transactions
+├── changes.py    # Change detection and entity matching
 ├── models.py     # Shared result dataclasses and types
 └── tests/        # Automated behavior tests
 ```
@@ -42,6 +43,7 @@ ESET_solution/
 flowchart LR
     A[main.py] --> B[cli.py]
     B --> C[database.py]
+    C --> G[changes.py]
     C --> D[scanner.py]
     C --> E[hashing.py]
     B --> F[models.py]
