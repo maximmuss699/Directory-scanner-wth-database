@@ -16,18 +16,21 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Store the current state of a directory in SQLite."
     )
+    # By default, scan the sample folder in the parent directory of this script.
     parser.add_argument(
         "folder",
         nargs="?",
         default=default_folder,
         help="directory to scan (default: supplied sample folder)",
     )
+    # Database path is optional, with a default in the same directory as this script.
     parser.add_argument(
         "--database",
         "-d",
         default=default_database,
         help="SQLite database path",
     )
+    # Limit the number of changes to display, with a default of 20.
     parser.add_argument(
         "--show-changes",
         type=int,
@@ -35,6 +38,7 @@ def parse_arguments() -> argparse.Namespace:
         metavar="N",
         help="show at most N detected changes (default: 20)",
     )
+    # We have three hashing modes: always, changed, and off. The default is always.
     parser.add_argument(
         "--hash-mode",
         choices=HASH_MODES,

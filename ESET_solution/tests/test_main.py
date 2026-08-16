@@ -622,109 +622,6 @@ class UpdateSnapshotTests(unittest.TestCase):
         always_result = self.scan()
         self.assert_change_counts(always_result, modify=1)
 
-    def test_existing_metadata_only_database_is_migrated(self):
-        with sqlite3.connect(self.database) as connection:
-            connection.execute(
-                """
-                CREATE TABLE entries (
-                    path TEXT PRIMARY KEY,
-                    parent_path TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    entry_type TEXT NOT NULL,
-                    size INTEGER NOT NULL,
-                    modified_ns INTEGER NOT NULL,
-                    device_id INTEGER NOT NULL,
-                    file_id INTEGER NOT NULL
-                ) WITHOUT ROWID
-                """
-            )
-
-        (self.folder / "new.txt").write_text("content", encoding="utf-8")
-        update_snapshot(str(self.folder), str(self.database))
-
-        with sqlite3.connect(self.database) as connection:
-            columns = {
-                row[1]: row[2]
-                for row in connection.execute("PRAGMA table_info(entries)")
-            }
-            stored_hash = connection.execute(
-                "SELECT content_hash FROM entries WHERE path = 'new.txt'"
-            ).fetchone()[0]
-            identity_storage = connection.execute(
-                """
-                SELECT typeof(device_id), typeof(file_id)
-                FROM entries
-                WHERE path = 'new.txt'
-                """
-            ).fetchone()
-            schema_version = connection.execute(
-                "SELECT value FROM scan_metadata WHERE key = 'schema_version'"
-            ).fetchone()[0]
-
-        self.assertIn("content_hash", columns)
-        self.assertEqual(columns["device_id"], "TEXT")
-        self.assertEqual(columns["file_id"], "TEXT")
-        self.assertEqual(identity_storage, ("text", "text"))
-        self.assertEqual(schema_version, "3")
-        self.assertEqual(len(stored_hash), 32)
-
-    def test_populated_metadata_only_database_migrates_without_false_change(self):
-        file_path = self.folder / "existing.txt"
-        file_path.write_text("content", encoding="utf-8")
-        file_stat = file_path.stat()
-        with sqlite3.connect(self.database) as connection:
-            connection.execute(
-                """
-                CREATE TABLE entries (
-                    path TEXT PRIMARY KEY,
-                    parent_path TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    entry_type TEXT NOT NULL,
-                    size INTEGER NOT NULL,
-                    modified_ns INTEGER NOT NULL,
-                    device_id INTEGER NOT NULL,
-                    file_id INTEGER NOT NULL
-                ) WITHOUT ROWID
-                """
-            )
-            connection.execute(
-                """
-                INSERT INTO entries VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    "existing.txt",
-                    "",
-                    "existing.txt",
-                    "file",
-                    file_stat.st_size,
-                    file_stat.st_mtime_ns,
-                    file_stat.st_dev,
-                    file_stat.st_ino,
-                ),
-            )
-            connection.execute(
-                """
-                CREATE TABLE scan_metadata (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                ) WITHOUT ROWID
-                """
-            )
-            connection.execute(
-                "INSERT INTO scan_metadata (key, value) "
-                "VALUES ('scanned_root', ?)",
-                (os.path.normcase(os.path.realpath(self.folder)),),
-            )
-
-        result = self.scan()
-
-        self.assert_change_counts(result)
-        with sqlite3.connect(self.database) as connection:
-            stored_hash = connection.execute(
-                "SELECT content_hash FROM entries WHERE path = 'existing.txt'"
-            ).fetchone()[0]
-        self.assertEqual(len(stored_hash), 32)
-
     def test_enabling_hashing_does_not_report_a_false_modification(self):
         (self.folder / "legacy.txt").write_text("content", encoding="utf-8")
         update_snapshot(
@@ -809,28 +706,6 @@ class UpdateSnapshotTests(unittest.TestCase):
 
         expected_root = os.path.normcase(os.path.realpath(self.folder))
         self.assertEqual(stored_root, expected_root)
-
-    def test_unknown_database_schema_version_is_rejected(self):
-        (self.folder / "stable.txt").write_text("content", encoding="utf-8")
-        self.scan()
-        with sqlite3.connect(self.database) as connection:
-            connection.execute(
-                "UPDATE scan_metadata SET value = '999' "
-                "WHERE key = 'schema_version'"
-            )
-
-        with self.assertRaisesRegex(ValueError, "Unsupported database schema"):
-            self.scan()
-
-        with sqlite3.connect(self.database) as connection:
-            stored_version = connection.execute(
-                "SELECT value FROM scan_metadata WHERE key = 'schema_version'"
-            ).fetchone()[0]
-            entry_count = connection.execute(
-                "SELECT COUNT(*) FROM entries"
-            ).fetchone()[0]
-        self.assertEqual(stored_version, "999")
-        self.assertEqual(entry_count, 1)
 
     def test_equivalent_case_spelling_of_root_is_accepted(self):
         self.scan()

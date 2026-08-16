@@ -122,15 +122,15 @@ The persistent `entries` table stores:
 | `content_hash` | BLAKE2b-256 digest for regular files, stored as a BLOB |
 
 `entries_snapshot`, `entity_matches`, and `detected_changes` are temporary
-SQLite tables used only during a scan. `scan_metadata` stores the schema version
-and binds the database to one canonical scanned root. The database keeps the
-latest directory state, not a history of changes.
+SQLite tables used only during a scan. `scan_metadata` binds the database to one
+canonical scanned root. The database keeps the latest directory state, not a
+history of changes.
 
 The persistent table is synchronized incrementally. An unchanged scan compares
 all staged rows but does not delete and reinsert all persistent rows.
-Older databases with integer identity columns are migrated transactionally to
-schema version 3. Text storage safely represents Windows file IDs up to 128 bits
-without SQLite integer overflow.
+Text storage safely represents Windows file IDs up to 128 bits without SQLite
+integer overflow. Existing databases from older development versions are not
+supported; use a new database file with this submission.
 
 ## Setup and usage
 
@@ -225,7 +225,7 @@ python -m unittest discover -s tests -v
 
 Tests cover create, delete, content modification, rename collisions and swaps,
 same-path replacement, directory-tree renames, hard-link ambiguity, hash modes,
-restored timestamps, database migration and root binding, incremental writes,
+restored timestamps, database root binding, incremental writes,
 retry behavior, input validation, stable hashing, Windows-sized file IDs,
 junction handling, and transaction rollback.
 
