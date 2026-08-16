@@ -39,25 +39,6 @@ ESET_solution/
 └── tests/        # Automated behavior tests
 ```
 
-```mermaid
-flowchart LR
-    A[main.py] --> B[cli.py]
-    A --> C[database.py]
-    A --> D[scanner.py]
-    A --> E[hashing.py]
-    B --> C[database.py]
-    B --> F[models.py]
-    C --> G[changes.py]
-    C --> D[scanner.py]
-    C --> E[hashing.py]
-    C --> F
-    D --> F
-```
-
-Arrows in this diagram represent direct imports between project modules.
-The implementation is functional. Small immutable dataclasses represent
-results, while each module has one focused responsibility. This keeps the code
-modular without adding unnecessary class hierarchies.
 
 ## How it works
 
@@ -143,6 +124,12 @@ all staged rows but does not delete and reinsert all persistent rows.
 Text storage safely represents Windows file IDs up to 128 bits without SQLite
 integer overflow. Existing databases from older development versions are not
 supported; use a new database file with this submission.
+
+## Requirements
+
+- Python 3.9 or newer.
+- No third-party packages; `requirements.txt` contains no packages to install.
+- Windows, macOS, or Linux.
 
 ## Setup and usage
 
