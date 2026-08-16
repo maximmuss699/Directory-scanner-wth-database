@@ -42,15 +42,19 @@ ESET_solution/
 ```mermaid
 flowchart LR
     A[main.py] --> B[cli.py]
+    A --> C[database.py]
+    A --> D[scanner.py]
+    A --> E[hashing.py]
     B --> C[database.py]
+    B --> F[models.py]
     C --> G[changes.py]
     C --> D[scanner.py]
     C --> E[hashing.py]
-    B --> F[models.py]
     C --> F
     D --> F
 ```
 
+Arrows in this diagram represent direct imports between project modules.
 The implementation is functional. Small immutable dataclasses represent
 results, while each module has one focused responsibility. This keeps the code
 modular without adding unnecessary class hierarchies.
@@ -59,15 +63,21 @@ modular without adding unnecessary class hierarchies.
 
 ```mermaid
 flowchart TD
-    A[Directory] --> B[Iterative scan with os.scandir]
-    B --> H[Reuse valid hashes or hash file content]
-    H --> C[(Temporary entries_snapshot)]
+    A[Directory] --> B[Iterative metadata scan with os.scandir]
+    B --> C[(entries_snapshot with metadata)]
+    A --> R[Reuse and validate stored hashes]
+    C --> R
+    D[(Previous entries)] --> R
+    R --> H[Stable hash remaining files]
+    A --> H
+    H --> S[(Completed entries_snapshot)]
     D[(Previous entries)] --> M[Entity matching]
-    C --> M
+    S --> M
     M --> E[SQL comparison]
-    C --> E
+    D --> E
+    S --> E
     E --> F[Detected changes]
-    C --> G[Incrementally synchronize entries]
+    S --> G[Incrementally synchronize entries]
     G --> D
 ```
 
