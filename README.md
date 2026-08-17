@@ -88,8 +88,9 @@ snapshot.
   in chunks of at most 1 MiB and uses constant memory. Valid hashes of unchanged
   files are reused. Workloads of at least 256 files use four hashing workers and
   bounded batches of 128 paths.
-- **Entity matching:** unique `(device_id, file_id)` pairs identify renames;
-  ambiguous hard links are handled conservatively.
+- **Entity matching:** unique `(device_id, file_id)` pairs identify renames.
+  Remaining regular files at the same path are matched as updates; ambiguous
+  hard-link renames are handled conservatively.
 - **Change detection:** set-based SQLite queries find create, delete, modify,
   and rename events.
 - **Snapshot update:** only changed persistent rows are deleted or replaced.
@@ -102,23 +103,25 @@ flowchart LR
     B[(New snapshot)] --> C
     C -->|Only in new| D[Create]
     C -->|Only in old| E[Delete]
-    C -->|Content changed| F[Modify]
+    C -->|File changed or replaced| F[Modify]
     C -->|Same identity, new path| G[Rename]
 ```
 
 - **Create:** an entry exists only in the new snapshot.
 - **Delete:** an entry exists only in the old snapshot.
-- **Modify:** a matched file has different content. Hashes are used when
-  available; file size and modification time are the fallback.
+- **Modify:** a matched file has different content, or a new reliable
+  filesystem identity shows that it was replaced at the same path. Hashes are
+  used when available; file size and modification time are the fallback.
 - **Rename:** the same unique, non-zero filesystem identity has a new path.
 
 Rename detection avoids guessing. If one filesystem identity has several
 paths, as with hard links, the script reports create and delete changes instead.
 
-If an entry at the same path gets a different filesystem identity, it is
-reported as delete and create. A renamed and changed file produces both rename
-and modify. Moving a directory reports one directory rename without repeating
-every child path.
+A regular file replaced at the same path is reported as modify when its content
+or reliable filesystem identity changed. Changing a path between a file and a
+directory is reported as delete and create. A renamed and changed file produces
+both rename and modify. Moving a directory reports one directory rename without
+repeating every child path.
 
 ## Database
 
@@ -136,10 +139,23 @@ The persistent `entries` table stores:
 | `file_id` | Filesystem entry identifier stored as decimal text |
 | `content_hash` | BLAKE2b-256 digest for regular files, stored as a BLOB |
 
-`entries_snapshot`, `entity_matches`, and `detected_changes` are temporary
-SQLite tables used only during a scan. `scan_metadata` binds the database to one
-canonical scanned root. The database keeps the latest directory state, not a
-history of changes.
+`scan_metadata` binds the database to one canonical scanned root. The database
+keeps the latest directory state, not a history of changes.
+
+Temporary tables are used only while one scan is running:
+
+- `entries_snapshot` stores the new directory state.
+- `reusable_hashes` stores old hashes that are safe to reuse.
+- `files_to_hash` stores paths that still need hashing.
+- `entity_matches` connects old entries with new entries.
+- `detected_changes` stores the changes found during comparison.
+- `entries_to_write` stores paths that must be updated in `entries`.
+
+Three named indexes keep database lookups fast:
+
+- `idx_entries_file_identity` finds stored entries by filesystem identity.
+- `idx_entries_snapshot_identity` does the same for the new snapshot.
+- `idx_detected_changes_path` speeds up filtering and ordering detected changes.
 
 
 ## Requirements
@@ -295,8 +311,8 @@ content only when a new hash is needed.
 
 - A scan is not a perfect filesystem snapshot. If a file changes during the
   scan, the script retries once. A later change may be found on the next run.
-- A content change can be missed if the file keeps the same size and its old
-  modification time is restored.
+- An in-place content change can be missed if the file keeps the same size and
+  its old modification time is restored.
 - Hard links share the same filesystem identity. If a rename is unclear, the
   script reports a create and delete instead.
 - One database can track only one root directory. Use a separate database for

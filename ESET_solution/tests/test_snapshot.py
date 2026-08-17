@@ -180,15 +180,49 @@ class SnapshotBehaviorTests(SnapshotTestCase):
             {("a", "b"), ("a space", "z")},
         )
 
-    def test_same_path_identity_replacement_reports_delete_and_create(self):
-        """Check that replacing an entity at one path is delete plus create."""
+    def test_nested_directory_rename_keeps_independent_file_rename(self):
+        """Check that the nearest directory rename controls child collapsing."""
+        old_directory = self.folder / "a"
+        nested_directory = old_directory / "b"
+        nested_directory.mkdir(parents=True)
+        (nested_directory / "file.txt").write_text("content", encoding="utf-8")
+        self.scan()
+
+        new_directory = self.folder / "x"
+        old_directory.rename(new_directory)
+        (new_directory / "b").rename(new_directory / "c")
+        (new_directory / "b").mkdir()
+        (new_directory / "c" / "file.txt").rename(
+            new_directory / "b" / "file.txt"
+        )
+        result = self.scan()
+
+        self.assert_change_counts(result, create=1, rename=3)
+        self.assertEqual(
+            {
+                (change.previous_path, change.path)
+                for change in result.changes
+                if change.change_type == "rename"
+            },
+            {
+                ("a", "x"),
+                (os.path.join("a", "b"), os.path.join("x", "c")),
+                (
+                    os.path.join("a", "b", "file.txt"),
+                    os.path.join("x", "b", "file.txt"),
+                ),
+            },
+        )
+
+    def test_same_path_file_replacement_reports_modify(self):
+        """Check that replacing a file at one path is one modification."""
         file_path = self.folder / "replaced.txt"
         replacement_path = Path(self.temporary_directory.name) / "replacement.txt"
-        file_path.write_text("old entity", encoding="utf-8")
+        file_path.write_text("same content", encoding="utf-8")
         self.scan()
         previous_stat = file_path.stat()
 
-        replacement_path.write_text("new entity", encoding="utf-8")
+        replacement_path.write_text("same content", encoding="utf-8")
         os.replace(replacement_path, file_path)
         replacement_stat = file_path.stat()
         if (
@@ -198,10 +232,13 @@ class SnapshotBehaviorTests(SnapshotTestCase):
             self.skipTest("Filesystem reused the same identity for the replacement")
 
         result = self.scan()
-        self.assert_change_counts(result, create=1, delete=1)
+        self.assert_change_counts(result, modify=1)
         self.assertEqual(
-            {(change.change_type, change.path) for change in result.changes},
-            {("create", "replaced.txt"), ("delete", "replaced.txt")},
+            [
+                (change.change_type, change.path, change.previous_path)
+                for change in result.changes
+            ],
+            [("modify", "replaced.txt", None)],
         )
 
     def test_unchanged_file_reuses_its_hash(self):

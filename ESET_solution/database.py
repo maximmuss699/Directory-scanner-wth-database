@@ -336,10 +336,13 @@ def hash_snapshot_files(connection: sqlite3.Connection, folder_path: str) -> Non
     ).fetchone()[0]
     paths = connection.execute("SELECT path FROM files_to_hash")
 
-    if file_count < PARALLEL_HASH_THRESHOLD:
-        hash_files_sequentially(connection, folder_path, paths)
-    else:
-        hash_files_in_parallel(connection, folder_path, paths)
+    try:
+        if file_count < PARALLEL_HASH_THRESHOLD:
+            hash_files_sequentially(connection, folder_path, paths)
+        else:
+            hash_files_in_parallel(connection, folder_path, paths)
+    finally:
+        paths.close()
 
     connection.execute("DROP TABLE files_to_hash")
 

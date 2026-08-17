@@ -58,7 +58,8 @@ def build_entity_matches(connection: sqlite3.Connection) -> None:
               WHERE match.path = snapshot.path
           )
           AND (
-              (
+              previous.entry_type = 'file'
+              OR (
                   previous.device_id = snapshot.device_id
                   AND previous.file_id = snapshot.file_id
               )
@@ -92,9 +93,8 @@ def insert_reported_renames(connection: sqlite3.Connection) -> None:
             mapped_ancestor = directory_mappings.get(ancestor)
             if mapped_ancestor is not None:
                 suffix = previous_path[len(ancestor) :]
-                if path == mapped_ancestor + suffix:
-                    implied = True
-                    break
+                implied = path == mapped_ancestor + suffix
+                break
             ancestor = os.path.dirname(ancestor)
 
         if implied:
@@ -168,7 +168,7 @@ def detect_changes(connection: sqlite3.Connection) -> Dict[str, int]:
         )
         """
     )
-    # 5. Matched files with different content are modifies.
+    # 5. Matched files that changed or were replaced are modifies.
     connection.execute(
         """
         INSERT INTO detected_changes (change_type, path, previous_path)
@@ -182,13 +182,24 @@ def detect_changes(connection: sqlite3.Connection) -> Dict[str, int]:
         JOIN entries AS previous ON previous.path = match.previous_path
         JOIN entries_snapshot AS snapshot ON snapshot.path = match.path
         WHERE snapshot.entry_type = 'file'
-          AND CASE
-              WHEN previous.content_hash IS NOT NULL
-               AND snapshot.content_hash IS NOT NULL
-              THEN previous.content_hash IS NOT snapshot.content_hash
-              ELSE previous.size != snapshot.size
-                OR previous.modified_ns != snapshot.modified_ns
-          END
+          AND (
+              CASE
+                  WHEN previous.content_hash IS NOT NULL
+                   AND snapshot.content_hash IS NOT NULL
+                  THEN previous.content_hash IS NOT snapshot.content_hash
+                  ELSE previous.size != snapshot.size
+                    OR previous.modified_ns != snapshot.modified_ns
+              END
+              OR (
+                  match.previous_path = match.path
+                  AND previous.file_id != '0'
+                  AND snapshot.file_id != '0'
+                  AND (
+                      previous.device_id != snapshot.device_id
+                      OR previous.file_id != snapshot.file_id
+                  )
+              )
+          )
         """
     )
     # 6. Add an index for result queries.
