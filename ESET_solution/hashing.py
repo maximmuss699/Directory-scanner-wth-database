@@ -14,15 +14,23 @@ class FileChangedDuringHashingError(RuntimeError):
 
 def same_file_state(first: os.stat_result, second: os.stat_result) -> bool:
     """Return whether two stat results describe one stable regular file."""
-    return (
+    same_portable_state = (
         stat_module.S_ISREG(first.st_mode)
         and stat_module.S_ISREG(second.st_mode)
         and first.st_dev == second.st_dev
         and first.st_ino == second.st_ino
         and first.st_size == second.st_size
         and first.st_mtime_ns == second.st_mtime_ns
-        and first.st_ctime_ns == second.st_ctime_ns
     )
+
+    if not same_portable_state:
+        return False
+
+    # On modern Python versions, Windows can report different st_ctime_ns
+    # values for os.stat(path) and os.fstat(handle) for the same unchanged
+    # file. Identity, size, and modification time remain consistent and are
+    # sufficient for the checks surrounding the content read.
+    return os.name == "nt" or first.st_ctime_ns == second.st_ctime_ns
 
 
 def calculate_stable_hash(file_path: str) -> Tuple[bytes, os.stat_result]:

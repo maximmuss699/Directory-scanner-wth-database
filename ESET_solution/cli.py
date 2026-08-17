@@ -10,7 +10,6 @@ from models import ScanResult
 
 
 solution_directory = os.path.dirname(os.path.abspath(__file__))
-default_folder = os.path.abspath(os.path.join(solution_directory, "..", "folder"))
 default_database = os.path.join(solution_directory, "scan_result.db")
 
 
@@ -18,12 +17,10 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Store the current state of a directory in SQLite."
     )
-    # By default, scan the sample folder in the parent directory of this script.
+    # Require the directory explicitly so a fresh checkout works without sample data.
     parser.add_argument(
         "folder",
-        nargs="?",
-        default=default_folder,
-        help="directory to scan (default: supplied sample folder)",
+        help="directory to scan",
     )
     # Database path is optional, with a default in the same directory as this script.
     parser.add_argument(

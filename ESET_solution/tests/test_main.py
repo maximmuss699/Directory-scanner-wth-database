@@ -4,14 +4,18 @@ import sqlite3
 import stat as stat_module
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from cli import main as cli_main, print_result
 from database import update_snapshot
-from hashing import FileChangedDuringHashingError, calculate_stable_hash
+from hashing import (
+    FileChangedDuringHashingError,
+    calculate_stable_hash,
+    same_file_state,
+)
 from scanner import scan_folder
 
 
@@ -103,7 +107,7 @@ class UpdateSnapshotTests(unittest.TestCase):
 
         self.assert_change_counts(result, create=2)
         self.assertEqual(result.entry_count, 2)
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             entry_type = connection.execute(
                 "SELECT entry_type FROM entries WHERE path = ?",
                 (os.path.join("subdirectory", "back-to-root"),),
@@ -157,7 +161,7 @@ class UpdateSnapshotTests(unittest.TestCase):
             ),
             ("large-identity", "renamed-large-identity"),
         )
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             stored = connection.execute(
                 """
                 SELECT device_id, file_id, typeof(device_id), typeof(file_id)
@@ -405,7 +409,7 @@ class UpdateSnapshotTests(unittest.TestCase):
             result = update_snapshot(str(self.folder), str(self.database))
 
         self.assert_change_counts(result, delete=1)
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             entry_count = connection.execute(
                 "SELECT COUNT(*) FROM entries"
             ).fetchone()[0]
@@ -476,7 +480,7 @@ class UpdateSnapshotTests(unittest.TestCase):
         """Check that unchanged rows are not written again."""
         (self.folder / "stable.txt").write_text("content", encoding="utf-8")
         self.scan()
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute("CREATE TABLE entry_write_audit (operation TEXT)")
             for operation in ("INSERT", "UPDATE", "DELETE"):
                 connection.execute(
@@ -491,7 +495,7 @@ class UpdateSnapshotTests(unittest.TestCase):
 
         result = self.scan()
         self.assert_change_counts(result)
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             write_count = connection.execute(
                 "SELECT COUNT(*) FROM entry_write_audit"
             ).fetchone()[0]
@@ -555,6 +559,31 @@ class UpdateSnapshotTests(unittest.TestCase):
 
         # Two attempts, each with a stat before and after reading the path.
         self.assertEqual(mocked_stat.call_count, 4)
+
+    def test_windows_stable_hash_ignores_inconsistent_ctime(self):
+        """Check Windows path and descriptor ctime differences are harmless."""
+        first = SimpleNamespace(
+            st_mode=stat_module.S_IFREG,
+            st_dev=1,
+            st_ino=2,
+            st_size=3,
+            st_mtime_ns=4,
+            st_ctime_ns=5,
+        )
+        second = SimpleNamespace(
+            st_mode=stat_module.S_IFREG,
+            st_dev=1,
+            st_ino=2,
+            st_size=3,
+            st_mtime_ns=4,
+            st_ctime_ns=6,
+        )
+
+        with patch("hashing.os.name", "nt"):
+            self.assertTrue(same_file_state(first, second))
+
+        with patch("hashing.os.name", "posix"):
+            self.assertFalse(same_file_state(first, second))
 
 
 if __name__ == "__main__":

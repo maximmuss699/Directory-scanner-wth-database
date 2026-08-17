@@ -161,10 +161,11 @@ py -m venv ESET_solution\.venv
 ESET_solution\.venv\Scripts\Activate.ps1
 ```
 
-Scan the supplied sample directory using the default database:
+Scan the supplied sample directory using the default database after extracting
+it to `folder/` at the repository root:
 
 ```bash
-python ESET_solution/main.py
+python ESET_solution/main.py folder
 ```
 
 Scan another directory:
@@ -179,7 +180,7 @@ database for a different scanned root is rejected.
 Show at most five detected changes:
 
 ```bash
-python ESET_solution/main.py --show-changes 5
+python ESET_solution/main.py folder --show-changes 5
 ```
 
 ### Hashing strategy
@@ -242,11 +243,13 @@ rollback.
 ## Stable hashing and performance
 
 Regular files are read in 1 MiB chunks, so hashing uses constant memory. Before
-and after reading, the hasher verifies file type, device ID, file ID, size,
-modification time, and `ctime` using both `os.fstat()` and a final
-`os.stat(path)`. The final path check catches a file being replaced while its
-old open descriptor remains readable. An unstable file is retried once; the
-complete directory scan is then retried once before the transaction is aborted.
+and after reading, the hasher verifies file type, device ID, file ID, size, and
+modification time using both `os.fstat()` and a final `os.stat(path)`. On
+non-Windows systems it also checks `ctime`; modern Python versions can report
+inconsistent path and descriptor `ctime` values on Windows. The final path
+check catches a file being replaced while its old open descriptor remains
+readable. An unstable file is retried once; the complete directory scan is then
+retried once before the transaction is aborted.
 
 No userspace scanner can eliminate a filesystem race after its final metadata
 check. The first scan takes approximately
