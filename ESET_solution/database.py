@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import stat as stat_module
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Tuple
 
 from changes import build_entity_matches, detect_changes
@@ -10,12 +11,21 @@ from scanner import scan_folder
 
 
 SCAN_ATTEMPTS = 2
+HASH_WORKERS = 4
+HASH_BATCH_SIZE = 128
+PARALLEL_HASH_THRESHOLD = 256
 UNSTABLE_SCAN_ERRORS = (
     FileNotFoundError,
     NotADirectoryError,
     IsADirectoryError,
     FileChangedDuringHashingError,
 )
+
+UPDATE_SNAPSHOT_HASH_SQL = """
+    UPDATE entries_snapshot
+    SET size = ?, modified_ns = ?, device_id = ?, file_id = ?, content_hash = ?
+    WHERE path = ?
+"""
 
 
 def canonical_path(path: str) -> str:
@@ -236,6 +246,67 @@ def validate_reused_files(connection: sqlite3.Connection, folder_path: str) -> N
             )
 
 
+def hash_update_parameters(
+    relative_path: str,
+    hash_result: Tuple[bytes, os.stat_result],
+) -> Tuple[int, int, str, str, bytes, str]:
+    """Build one snapshot update on the main thread."""
+    content_hash, entry_stat = hash_result
+    return (
+        entry_stat.st_size,
+        entry_stat.st_mtime_ns,
+        str(entry_stat.st_dev),
+        str(entry_stat.st_ino),
+        content_hash,
+        relative_path,
+    )
+
+
+def hash_files_sequentially(
+    connection: sqlite3.Connection,
+    folder_path: str,
+    paths: sqlite3.Cursor,
+) -> None:
+    """Hash a small number of files on the main thread."""
+    for (relative_path,) in paths:
+        file_path = os.path.join(folder_path, relative_path)
+        hash_result = calculate_stable_hash(file_path)
+        connection.execute(
+            UPDATE_SNAPSHOT_HASH_SQL,
+            hash_update_parameters(relative_path, hash_result),
+        )
+
+
+def hash_files_in_parallel(
+    connection: sqlite3.Connection,
+    folder_path: str,
+    paths: sqlite3.Cursor,
+) -> None:
+    """Hash bounded batches in workers and update SQLite on the main thread."""
+    with ThreadPoolExecutor(max_workers=HASH_WORKERS) as executor:
+        while batch := paths.fetchmany(HASH_BATCH_SIZE):
+            futures = {
+                executor.submit(
+                    calculate_stable_hash,
+                    os.path.join(folder_path, relative_path),
+                ): relative_path
+                for (relative_path,) in batch
+            }
+            updates = []
+            try:
+                for future in as_completed(futures):
+                    relative_path = futures[future]
+                    updates.append(
+                        hash_update_parameters(relative_path, future.result())
+                    )
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
+
+            connection.executemany(UPDATE_SNAPSHOT_HASH_SQL, updates)
+
+
 def hash_snapshot_files(connection: sqlite3.Connection, folder_path: str) -> None:
     """Reuse stable hashes and hash the remaining files."""
     reuse_snapshot_hashes(connection)
@@ -256,25 +327,15 @@ def hash_snapshot_files(connection: sqlite3.Connection, folder_path: str) -> Non
         """
     )
 
-    for (relative_path,) in connection.execute("SELECT path FROM files_to_hash"):
-        file_path = os.path.join(folder_path, relative_path)
-        content_hash, entry_stat = calculate_stable_hash(file_path)
-        connection.execute(
-            """
-            UPDATE entries_snapshot
-            SET size = ?, modified_ns = ?, device_id = ?, file_id = ?,
-                content_hash = ?
-            WHERE path = ?
-            """,
-            (
-                entry_stat.st_size,
-                entry_stat.st_mtime_ns,
-                str(entry_stat.st_dev),
-                str(entry_stat.st_ino),
-                content_hash,
-                relative_path,
-            ),
-        )
+    file_count = connection.execute(
+        "SELECT COUNT(*) FROM files_to_hash"
+    ).fetchone()[0]
+    paths = connection.execute("SELECT path FROM files_to_hash")
+
+    if file_count < PARALLEL_HASH_THRESHOLD:
+        hash_files_sequentially(connection, folder_path, paths)
+    else:
+        hash_files_in_parallel(connection, folder_path, paths)
 
     connection.execute("DROP TABLE files_to_hash")
 

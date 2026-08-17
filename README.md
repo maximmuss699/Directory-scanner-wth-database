@@ -49,7 +49,7 @@ flowchart TD
     A --> R[Reuse and validate stored hashes]
     C --> R
     D[(Previous entries)] --> R
-    R --> H[Stable hash remaining files]
+    R --> H[Sequential or bounded parallel stable hashing]
     A --> H
     H --> S[(Completed entries_snapshot)]
     D[(Previous entries)] --> M[Entity matching]
@@ -68,6 +68,10 @@ directly without repeatedly normalizing the complete path.
 Symbolic links and Windows junction/reparse directories are stored as entries
 but never traversed. A visited-directory identity set provides an additional
 cycle guard.
+Fewer than 256 files are hashed sequentially. Larger workloads are fetched from
+SQLite in batches of 128 paths and sent to four `ThreadPoolExecutor` workers.
+Workers only read and hash files; the main thread collects each complete batch
+and performs all SQLite updates.
 The database update runs in a transaction. An observed filesystem race causes
 one complete retry. If the retry or another operation fails, the previous valid
 snapshot remains unchanged.
@@ -80,7 +84,8 @@ snapshot remains unchanged.
   symbolic links and Windows junctions are not followed.
 - **Content hashing:** BLAKE2b reads exactly the descriptor-reported file size
   in chunks of at most 1 MiB and uses constant memory. Valid hashes of unchanged
-  files are reused.
+  files are reused. Workloads of at least 256 files use four hashing workers and
+  bounded batches of 128 paths.
 - **Entity matching:** unique `(device_id, file_id)` pairs identify renames;
   ambiguous hard links are handled conservatively.
 - **Change detection:** set-based SQLite queries find create, delete, modify,
@@ -241,7 +246,8 @@ Tests cover create, delete, content modification, rename collisions and swaps,
 same-path replacement, directory-tree renames, hard-link ambiguity, hash reuse,
 database root binding, incremental writes, retry behavior, input validation,
 stable hashing, size-bounded reads, direct relative-path construction,
-Windows-sized file IDs, junction handling, and transaction rollback.
+bounded parallel hashing, worker-failure rollback, Windows-sized file IDs,
+junction handling, and transaction rollback.
 
 ## Stable hashing and performance
 
@@ -256,6 +262,12 @@ inconsistent path and descriptor `ctime` values on Windows. The final path
 check catches a file being replaced while its old open descriptor remains
 readable. An unstable file is retried once; the complete directory scan is then
 retried once before the transaction is aborted.
+
+Parallel hashing never shares the SQLite connection with worker threads. The
+main thread reads one bounded path batch, workers call only the stable hashing
+function, and the main thread applies the completed batch with `executemany()`.
+If a worker fails, pending work in that batch is cancelled and the exception is
+propagated into the existing savepoint rollback and full-scan retry.
 
 No userspace scanner can eliminate a filesystem race after its final metadata
 check. The first scan takes approximately
@@ -281,13 +293,14 @@ across 100 directories. The database was stored outside the scanned directory,
 and dataset generation was excluded. The current Windows results are medians
 of three trials on an Intel Core i5-1145G7 with Python 3.14.7. The macOS ARM64
 figures were recorded previously with Python 3.9.6, before the direct-path and
-size-bounded-read optimizations, so they are included only as a reference.
+size-bounded-read and parallel-hashing optimizations, so they are included only
+as a reference.
 
 | Scenario | Entries | Result | Windows current | macOS ARM64 reference |
 |---|---:|---|---:|---:|
-| First scan | 10,100 | 10,100 created | 1.95 s | 0.91 s |
-| Unchanged scan | 10,100 | No changes | 0.75 s | 0.28-0.29 s |
-| 100 files changed from 1 KiB to 2 KiB | 10,100 | 100 modified | 0.90 s | 0.29 s |
+| First scan | 10,100 | 10,100 created | 1.51 s | 0.91 s |
+| Unchanged scan | 10,100 | No changes | 0.83 s | 0.28-0.29 s |
+| 100 files changed from 1 KiB to 2 KiB | 10,100 | 100 modified | 0.82 s | 0.29 s |
 
 The unchanged scan is faster because valid stored hashes are reused instead of
 reading every file again. These numbers are illustrative: filesystem type,
