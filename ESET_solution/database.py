@@ -153,6 +153,7 @@ def prepare_tables(connection: sqlite3.Connection, scanned_root: str) -> None:
 
 def reuse_snapshot_hashes(connection: sqlite3.Connection) -> None:
     """Reuse valid file hashes."""
+    # 1. Create a temporary table to hold reusable hashes.
     connection.execute(
         """
         CREATE TEMP TABLE reusable_hashes (
@@ -161,6 +162,7 @@ def reuse_snapshot_hashes(connection: sqlite3.Connection) -> None:
         ) WITHOUT ROWID
         """
     )
+    # 2. Reuse hashes for files that have not changed between the previous and current snapshot.
     connection.execute(
         """
         INSERT INTO reusable_hashes (path, content_hash)
@@ -176,6 +178,7 @@ def reuse_snapshot_hashes(connection: sqlite3.Connection) -> None:
           AND previous.content_hash IS NOT NULL
         """
     )
+    # 3. Reuse hashes for files that have moved or been renamed but are otherwise identical.
     connection.execute(
         """
         INSERT OR IGNORE INTO reusable_hashes (path, content_hash)
@@ -203,6 +206,7 @@ def reuse_snapshot_hashes(connection: sqlite3.Connection) -> None:
           AND previous.content_hash IS NOT NULL
         """
     )
+    # 4. Update the snapshot with the reused hashes and drop the temporary table.
     connection.execute(
         """
         UPDATE entries_snapshot
@@ -217,6 +221,7 @@ def reuse_snapshot_hashes(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    # 5. Drop the temporary table after use.
     connection.execute("DROP TABLE reusable_hashes")
 
 
