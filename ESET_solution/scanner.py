@@ -28,8 +28,9 @@ def is_directory_junction(entry: os.DirEntry, entry_stat: os.stat_result) -> boo
 
 def scan_folder(root_path: str) -> Iterator[EntryRecord]:
     """Scan a directory tree and yield one record for each entry."""
-    # 1. Start with the root directory.
-    directories_to_scan = [root_path]
+    # 1. Keep absolute and relative directory paths together. Building child
+    # paths directly avoids normalizing both paths again for every entry.
+    directories_to_scan = [(root_path, "")]
     root_stat = os.stat(root_path)
     visited_directories = set()
 
@@ -39,7 +40,7 @@ def scan_folder(root_path: str) -> Iterator[EntryRecord]:
 
     while directories_to_scan:
         # 2. Take the next directory from the stack.
-        current_directory = directories_to_scan.pop()
+        current_directory, current_relative_path = directories_to_scan.pop()
 
         # 3. Read all entries in the directory.
         with os.scandir(current_directory) as entries:
@@ -61,12 +62,16 @@ def scan_folder(root_path: str) -> Iterator[EntryRecord]:
                     # Do not try to hash devices, sockets, or named pipes.
                     entry_type = "other"
 
-                relative_path = os.path.relpath(entry_path, root_path)
+                relative_path = (
+                    os.path.join(current_relative_path, entry.name)
+                    if current_relative_path
+                    else entry.name
+                )
 
                 # 5. Send the entry metadata to SQLite.
                 yield (
                     relative_path,
-                    os.path.dirname(relative_path),
+                    current_relative_path,
                     entry.name,
                     entry_type,
                     entry_stat.st_size,
@@ -85,4 +90,4 @@ def scan_folder(root_path: str) -> Iterator[EntryRecord]:
                     ):
                         if entry_stat.st_ino != 0:
                             visited_directories.add(directory_identity)
-                        directories_to_scan.append(entry_path)
+                        directories_to_scan.append((entry_path, relative_path))

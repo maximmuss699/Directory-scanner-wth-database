@@ -62,7 +62,9 @@ flowchart TD
     G --> D
 ```
 
-The scanner uses an explicit LIFO stack instead of recursion.
+The scanner uses an explicit LIFO stack instead of recursion. Each pending
+directory carries both its absolute and relative path, so child paths are built
+directly without repeatedly normalizing the complete path.
 Symbolic links and Windows junction/reparse directories are stored as entries
 but never traversed. A visited-directory identity set provides an additional
 cycle guard.
@@ -73,11 +75,12 @@ snapshot remains unchanged.
 ## Algorithms
 
 - **Directory scan:** iterative depth-first traversal with `os.scandir()` and a
-  LIFO stack, without Python recursion.
+  LIFO stack, without Python recursion or per-entry `os.path.relpath()` calls.
 - **Cycle protection:** visited directory identities prevent repeated traversal;
   symbolic links and Windows junctions are not followed.
-- **Content hashing:** BLAKE2b reads files in 1 MiB chunks and uses constant
-  memory. Valid hashes of unchanged files are reused.
+- **Content hashing:** BLAKE2b reads exactly the descriptor-reported file size
+  in chunks of at most 1 MiB and uses constant memory. Valid hashes of unchanged
+  files are reused.
 - **Entity matching:** unique `(device_id, file_id)` pairs identify renames;
   ambiguous hard links are handled conservatively.
 - **Change detection:** set-based SQLite queries find create, delete, modify,
@@ -237,14 +240,17 @@ python -m unittest discover -s tests -v
 Tests cover create, delete, content modification, rename collisions and swaps,
 same-path replacement, directory-tree renames, hard-link ambiguity, hash reuse,
 database root binding, incremental writes, retry behavior, input validation,
-stable hashing, Windows-sized file IDs, junction handling, and transaction
-rollback.
+stable hashing, size-bounded reads, direct relative-path construction,
+Windows-sized file IDs, junction handling, and transaction rollback.
 
 ## Stable hashing and performance
 
-Regular files are read in 1 MiB chunks, so hashing uses constant memory. Before
-and after reading, the hasher verifies file type, device ID, file ID, size, and
-modification time using both `os.fstat()` and a final `os.stat(path)`. On
+Regular files are read in 1 MiB chunks, so hashing uses constant memory. The
+size returned by the first `os.fstat()` is used as the exact byte budget. This
+supports partial reads without issuing an additional read only to discover EOF;
+an unexpected early EOF leaves the budget incomplete and causes a retry.
+Before and after reading, the hasher verifies file type, device ID, file ID,
+size, and modification time using `os.fstat()` and a final `os.stat(path)`. On
 non-Windows systems it also checks `ctime`; modern Python versions can report
 inconsistent path and descriptor `ctime` values on Windows. The final path
 check catches a file being replaced while its old open descriptor remains
@@ -271,14 +277,17 @@ are checked with metadata and do not need to be read again.
 ## Performance measurements
 
 The following local benchmark used 10,000 files of 1 KiB each, distributed
-across 100 directories. The database was stored outside the scanned directory.
-The measurement was run on macOS ARM64 with Python 3.9.6 using the CLI timer.
+across 100 directories. The database was stored outside the scanned directory,
+and dataset generation was excluded. The current Windows results are medians
+of three trials on an Intel Core i5-1145G7 with Python 3.14.7. The macOS ARM64
+figures were recorded previously with Python 3.9.6, before the direct-path and
+size-bounded-read optimizations, so they are included only as a reference.
 
-| Scenario | Entries | Result | Duration |
-|---|---:|---|---:|
-| First scan | 10,100 | 10,100 created | 0.91 s |
-| Unchanged scan | 10,100 | No changes | 0.28-0.29 s |
-| 100 files changed from 1 KiB to 2 KiB | 10,100 | 100 modified | 0.29 s |
+| Scenario | Entries | Result | Windows current | macOS ARM64 reference |
+|---|---:|---|---:|---:|
+| First scan | 10,100 | 10,100 created | 1.95 s | 0.91 s |
+| Unchanged scan | 10,100 | No changes | 0.75 s | 0.28-0.29 s |
+| 100 files changed from 1 KiB to 2 KiB | 10,100 | 100 modified | 0.90 s | 0.29 s |
 
 The unchanged scan is faster because valid stored hashes are reused instead of
 reading every file again. These numbers are illustrative: filesystem type,

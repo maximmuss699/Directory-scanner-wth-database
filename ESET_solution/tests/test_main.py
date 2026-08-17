@@ -1,3 +1,4 @@
+import hashlib
 import io
 import os
 import sqlite3
@@ -206,6 +207,26 @@ class UpdateSnapshotTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0][3], "junction")
         scandir.assert_called_once_with(str(self.folder))
+
+    def test_scanner_builds_relative_paths_during_traversal(self):
+        """Check nested paths do not require repeated path normalization."""
+        nested_directory = self.folder / "outer" / "inner"
+        nested_directory.mkdir(parents=True)
+        nested_file = nested_directory / "file.txt"
+        nested_file.write_text("content", encoding="utf-8")
+
+        with patch(
+            "scanner.os.path.relpath",
+            side_effect=AssertionError("os.path.relpath should not be called"),
+        ):
+            records = list(scan_folder(str(self.folder)))
+
+        records_by_path = {record[0]: record for record in records}
+        relative_file_path = os.path.join("outer", "inner", "file.txt")
+        self.assertEqual(
+            records_by_path[relative_file_path][1],
+            os.path.join("outer", "inner"),
+        )
 
     def test_rename_and_content_change_reports_both_changes(self):
         """Check that a renamed and modified file reports both changes."""
@@ -559,6 +580,40 @@ class UpdateSnapshotTests(unittest.TestCase):
 
         # Two attempts, each with a stat before and after reading the path.
         self.assertEqual(mocked_stat.call_count, 4)
+
+    def test_stable_hash_reads_exactly_the_stat_size(self):
+        """Check hashing does not issue an extra read to discover EOF."""
+        file_path = self.folder / "sized.txt"
+        file_path.write_bytes(b"abcdef")
+
+        class TrackingFile:
+            def __init__(self, path):
+                self.file = open(path, "rb")
+                self.read_sizes = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                self.file.close()
+
+            def fileno(self):
+                return self.file.fileno()
+
+            def read(self, size):
+                self.read_sizes.append(size)
+                return self.file.read(size)
+
+        tracked_file = TrackingFile(file_path)
+        with patch("hashing.open", return_value=tracked_file, create=True):
+            with patch("hashing.HASH_CHUNK_SIZE", 4):
+                content_hash, _ = calculate_stable_hash(str(file_path))
+
+        self.assertEqual(tracked_file.read_sizes, [4, 2])
+        self.assertEqual(
+            content_hash,
+            hashlib.blake2b(b"abcdef", digest_size=32).digest(),
+        )
 
     def test_windows_stable_hash_ignores_inconsistent_ctime(self):
         """Check Windows path and descriptor ctime differences are harmless."""

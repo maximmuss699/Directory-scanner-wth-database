@@ -26,10 +26,6 @@ def same_file_state(first: os.stat_result, second: os.stat_result) -> bool:
     if not same_portable_state:
         return False
 
-    # On modern Python versions, Windows can report different st_ctime_ns
-    # values for os.stat(path) and os.fstat(handle) for the same unchanged
-    # file. Identity, size, and modification time remain consistent and are
-    # sufficient for the checks surrounding the content read.
     return os.name == "nt" or first.st_ctime_ns == second.st_ctime_ns
 
 
@@ -50,11 +46,14 @@ def calculate_stable_hash(file_path: str) -> Tuple[bytes, os.stat_result]:
                     continue
 
                 digest = hashlib.blake2b(digest_size=HASH_DIGEST_SIZE)
-                while True:
-                    chunk = file.read(HASH_CHUNK_SIZE)
+                # Read the observed size exactly, without a final EOF probe.
+                remaining_bytes = descriptor_before.st_size
+                while remaining_bytes:
+                    chunk = file.read(min(HASH_CHUNK_SIZE, remaining_bytes))
                     if not chunk:
                         break
                     digest.update(chunk)
+                    remaining_bytes -= len(chunk)
 
                 # 4. Check the open file after reading it.
                 descriptor_after = os.fstat(file.fileno())
@@ -68,7 +67,8 @@ def calculate_stable_hash(file_path: str) -> Tuple[bytes, os.stat_result]:
 
         # 6. Return the hash only when every state matches.
         if (
-            same_file_state(path_before, descriptor_before)
+            remaining_bytes == 0
+            and same_file_state(path_before, descriptor_before)
             and same_file_state(descriptor_before, descriptor_after)
             and same_file_state(descriptor_after, path_after)
         ):
