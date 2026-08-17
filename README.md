@@ -32,11 +32,16 @@ ESET_solution/
 ├── main.py       # Small command-line entry point
 ├── cli.py        # Arguments and terminal output
 ├── scanner.py    # Iterative filesystem traversal
-├── hashing.py    # Stable BLAKE2b content hashing
+├── hashing.py    # BLAKE2b content hashing
 ├── database.py   # SQLite snapshots and transactions
 ├── changes.py    # Change detection and entity matching
 ├── models.py     # Shared result dataclasses and types
-└── tests/        # Automated behavior tests
+└── tests/
+    ├── support.py                # Shared test setup
+    ├── test_snapshot.py          # Change detection and database safety
+    ├── test_scanner.py           # Traversal and link handling
+    ├── test_hashing.py           # Stable file hashing
+    └── test_parallel_hashing.py  # Worker and rollback behavior
 ```
 
 
@@ -44,42 +49,39 @@ ESET_solution/
 
 ```mermaid
 flowchart TD
-    A[Directory] --> B[Iterative metadata scan with os.scandir]
-    B --> C[(entries_snapshot with metadata)]
-    A --> R[Reuse and validate stored hashes]
-    C --> R
-    D[(Previous entries)] --> R
-    R --> H[Sequential or bounded parallel stable hashing]
-    A --> H
-    H --> S[(Completed entries_snapshot)]
-    D[(Previous entries)] --> M[Entity matching]
-    S --> M
-    M --> E[SQL comparison]
-    D --> E
-    S --> E
-    E --> F[Detected changes]
-    S --> G[Incrementally synchronize entries]
-    G --> D
+    A[Scan directory metadata] --> B[(Current snapshot)]
+    B --> C[Reuse valid stored hashes]
+    P[(Previous snapshot)] --> C
+    C --> D[Hash files whose hashes cannot be reused]
+    D --> E[Match entries by filesystem identity]
+    P --> E
+    E --> F[Compare the two snapshots]
+    F --> G[Report create, delete, rename, and modify]
+    F --> H[Update the stored snapshot]
+    H -->|Used on the next run| P
 ```
 
-The scanner uses an explicit LIFO stack instead of recursion. Each pending
-directory carries both its absolute and relative path, so child paths are built
-directly without repeatedly normalizing the complete path.
-Symbolic links and Windows junction/reparse directories are stored as entries
-but never traversed. A visited-directory identity set provides an additional
-cycle guard.
-Fewer than 256 files are hashed sequentially. Larger workloads are fetched from
-SQLite in batches of 128 paths and sent to four `ThreadPoolExecutor` workers.
-Workers only read and hash files; the main thread collects each complete batch
-and performs all SQLite updates.
-The database update runs in a transaction. An observed filesystem race causes
-one complete retry. If the retry or another operation fails, the previous valid
-snapshot remains unchanged.
+The scanner uses `os.scandir()` and a stack. It builds relative paths as it
+scans. Symbolic links and Windows junctions are saved but not followed, and
+directory identities help prevent cycles.
+
+Hashes are reused when file metadata and filesystem identity have not changed.
+Fewer than 256 files are hashed one by one. Larger workloads use four workers
+and batches of 128 paths. Workers only hash files; the main thread handles
+SQLite.
+
+Filesystem identities help detect renames. SQLite compares the old and new
+snapshots to find created, deleted, renamed, and modified entries. It updates
+only changed rows.
+
+The update runs in one transaction. If the scan detects a filesystem change,
+it retries once. Any failure rolls back the update and keeps the previous
+snapshot.
 
 ## Algorithms
 
-- **Directory scan:** iterative depth-first traversal with `os.scandir()` and a
-  LIFO stack, without Python recursion or per-entry `os.path.relpath()` calls.
+- **Directory scan:** iterative DFS traversal with `os.scandir()` and a
+  LIFO stack.
 - **Cycle protection:** visited directory identities prevent repeated traversal;
   symbolic links and Windows junctions are not followed.
 - **Content hashing:** BLAKE2b reads exactly the descriptor-reported file size
@@ -96,29 +98,27 @@ snapshot remains unchanged.
 
 ```mermaid
 flowchart LR
-    A[Previous entries] --> C{Compare}
-    B[New snapshot] --> C
-    C -->|Unmatched new entity| D[Create]
-    C -->|Unmatched old entity| E[Delete]
-    C -->|Matched file, changed content| F[Modify]
-    C -->|Same unique identity, new path| G[Rename]
+    A[(Old snapshot)] --> C[Match and compare]
+    B[(New snapshot)] --> C
+    C -->|Only in new| D[Create]
+    C -->|Only in old| E[Delete]
+    C -->|Content changed| F[Modify]
+    C -->|Same identity, new path| G[Rename]
 ```
 
-- **Create:** a new entity cannot be matched to a previous entity.
-- **Delete:** a previous entity cannot be matched to a new entity.
-- **Modify:** a matched regular file has different content. When both hashes
-  are available, they are authoritative; otherwise size and modification time
-  are used as a fallback.
-- **Rename:** one unique, non-zero filesystem identity has a different path.
+- **Create:** an entry exists only in the new snapshot.
+- **Delete:** an entry exists only in the old snapshot.
+- **Modify:** a matched file has different content. Hashes are used when
+  available; file size and modification time are the fallback.
+- **Rename:** the same unique, non-zero filesystem identity has a new path.
 
-Rename detection is intentionally conservative. If an identity appears more
-than once, as can happen with hard links, the script reports path-based create
-and delete changes instead of guessing which path was renamed.
+Rename detection avoids guessing. If one filesystem identity has several
+paths, as with hard links, the script reports create and delete changes instead.
 
-A reliable identity changing at the same path is represented as a delete and a
-create. A renamed file whose content also changed produces both rename and
-modify. A directory-tree move is shown as one directory rename; descendant path
-changes implied by that move are not repeated in the terminal result.
+If an entry at the same path gets a different filesystem identity, it is
+reported as delete and create. A renamed and changed file produces both rename
+and modify. Moving a directory reports one directory rename without repeating
+every child path.
 
 ## Database
 
@@ -141,49 +141,77 @@ SQLite tables used only during a scan. `scan_metadata` binds the database to one
 canonical scanned root. The database keeps the latest directory state, not a
 history of changes.
 
-The persistent table is synchronized incrementally. An unchanged scan compares
-all staged rows but does not delete and reinsert all persistent rows.
-Text storage safely represents Windows file IDs up to 128 bits without SQLite
-integer overflow. Existing databases from older development versions are not
-supported; use a new database file with this submission.
 
 ## Requirements
 
-- Python 3.9 or newer.
-- No third-party packages; `requirements.txt` contains no packages to install.
+- Python 3.9 or later.
 - Windows, macOS, or Linux.
+- No third-party dependencies (`requirements.txt` is intentionally empty).
 
 ## Setup and usage
 
-Create and activate a virtual environment on macOS or Linux:
+### Windows PowerShell
 
-```bash
-python3 -m venv ESET_solution/.venv
-source ESET_solution/.venv/bin/activate
-```
+1. Open PowerShell and go to the repository:
 
-On Windows PowerShell:
+   ```powershell
+   cd "C:\path\to\ESET_task"
+   ```
 
-```powershell
-py -m venv ESET_solution\.venv
-ESET_solution\.venv\Scripts\Activate.ps1
-```
+2. Check that Python is installed:
 
-Scan the supplied sample directory using the default database after extracting
-it to `folder/` at the repository root:
+   ```powershell
+   python --version
+   ```
 
-```bash
-python ESET_solution/main.py folder
-```
+3. Create and activate a virtual environment:
 
-Scan another directory:
+   ```powershell
+   python -m venv ESET_solution\.venv
+   .\ESET_solution\.venv\Scripts\Activate.ps1
+   ```
 
-```bash
-python ESET_solution/main.py /path/to/folder --database /path/to/state.db
-```
 
-The SQLite database must be outside the scanned directory. Reusing an existing
-database for a different scanned root is rejected.
+4. Scan the supplied sample after extracting it to `folder` in the repository:
+
+   ```powershell
+   python .\ESET_solution\main.py .\folder
+   ```
+
+5. Scan another directory and choose a database location:
+
+   ```powershell
+   python .\ESET_solution\main.py "C:\Data\Files" --database "C:\Data\snapshot.db"
+   ```
+
+### macOS and Linux
+
+1. Open a terminal and go to the repository:
+
+   ```bash
+   cd "/path/to/ESET_task"
+   ```
+
+2. Check Python, then create and activate a virtual environment:
+
+   ```bash
+   python3 --version
+   python3 -m venv ESET_solution/.venv
+   source ESET_solution/.venv/bin/activate
+   ```
+
+3. Scan the supplied sample or another directory:
+
+   ```bash
+   python ESET_solution/main.py folder
+   python ESET_solution/main.py "/path/to/files" --database "/path/to/snapshot.db"
+   ```
+
+### Common options
+
+Without `--database`, the state is stored in
+`ESET_solution/scan_result.db`. The database must be outside the scanned
+directory, and each database can be used with only one scanned root.
 
 Show at most five detected changes:
 
@@ -191,17 +219,11 @@ Show at most five detected changes:
 python ESET_solution/main.py folder --show-changes 5
 ```
 
-### Hashing strategy
+Display all command-line options:
 
-The first scan hashes every regular file. Later scans reuse a stored hash when
-the file identity, size, and modification time are unchanged. A hash can also
-be reused after a rename when the filesystem identity is unique. New and
-metadata-changed files are hashed again.
-
-This single strategy balances content-based modification detection with the
-performance required for large directory trees. Like any metadata shortcut, it
-cannot detect a same-size content change when the modification time is also
-deliberately restored to its previous value.
+```bash
+python ESET_solution/main.py --help
+```
 
 Example summary:
 
@@ -224,12 +246,6 @@ Total    : 0
 No changes detected.
 ```
 
-Display all command-line options:
-
-```bash
-python ESET_solution/main.py --help
-```
-
 Expected input, filesystem, and database errors are printed as a short message
 to standard error, and the process exits with status code `1`.
 
@@ -239,62 +255,61 @@ Run the tests from the solution directory:
 
 ```bash
 cd ESET_solution
-python -m unittest discover -s tests -v
+python -m unittest discover -s tests -t . -v
 ```
 
-Tests cover create, delete, content modification, rename collisions and swaps,
-same-path replacement, directory-tree renames, hard-link ambiguity, hash reuse,
-database root binding, incremental writes, retry behavior, input validation,
-stable hashing, size-bounded reads, direct relative-path construction,
-bounded parallel hashing, worker-failure rollback, Windows-sized file IDs,
-junction handling, and transaction rollback.
 
-## Stable hashing and performance
+## Hashing and performance
 
-Regular files are read in 1 MiB chunks, so hashing uses constant memory. The
-size returned by the first `os.fstat()` is used as the exact byte budget. This
-supports partial reads without issuing an additional read only to discover EOF;
-an unexpected early EOF leaves the budget incomplete and causes a retry.
-Before and after reading, the hasher verifies file type, device ID, file ID,
-size, and modification time using `os.fstat()` and a final `os.stat(path)`. On
-non-Windows systems it also checks `ctime`; modern Python versions can report
-inconsistent path and descriptor `ctime` values on Windows. The final path
-check catches a file being replaced while its old open descriptor remains
-readable. An unstable file is retried once; the complete directory scan is then
-retried once before the transaction is aborted.
+The first scan hashes every regular file. Later scans reuse a stored hash when
+the filesystem identity, size, and modification time are unchanged. Hashes can
+also be reused after a rename when the filesystem identity is unique. Files
+whose previous hash cannot be safely reused are hashed again.
 
-Parallel hashing never shares the SQLite connection with worker threads. The
-main thread reads one bounded path batch, workers call only the stable hashing
-function, and the main thread applies the completed batch with `executemany()`.
-If a worker fails, pending work in that batch is cancelled and the exception is
-propagated into the existing savepoint rollback and full-scan retry.
+Files are read in chunks of up to 1 MiB, so memory use stays low. The hasher
+reads the expected file size and checks the file before and after reading. If
+the file changes or ends early, hashing is retried once.
 
-No userspace scanner can eliminate a filesystem race after its final metadata
-check. The first scan takes approximately
-`O(number of entries + total file bytes)`. Later scans take approximately
-`O(number of entries + bytes of files that need a new hash)`. Unchanged files
-are checked with metadata and do not need to be read again.
+For large workloads, four workers hash files in small batches. Workers never
+use SQLite; the main thread performs all database reads and writes. If a worker
+fails, pending work is cancelled and the scan is rolled back or retried.
+
+The first scan reads every file. Later scans check every entry, but read file
+content only when a new hash is needed.
+
+## Complexity and scaling
+
+- Scanning is `O(N)`, where `N` is the number of filesystem entries.
+- The first scan is `O(N + B)`, where `B` is the total number of file bytes.
+- Later scans are `O(N + R)`, where `R` is the number of bytes that need a new
+  hash.
+- SQLite uses indexed, set-based queries instead of pairwise Python
+  comparisons.
+- File records are streamed into SQLite, and parallel hashing is limited to
+  batches of 128 paths. Python keeps directory identities for cycle protection
+  but does not keep the full file list in memory.
+
+
 
 ## Known limitations
 
-- A userspace filesystem snapshot is not fully atomic. The scanner retries
-  observed races, but a change can still happen after the final metadata check.
-- A same-size content change can be missed if its modification time is also
-  restored, because the stored hash is considered reusable.
-- Hard links share one filesystem identity, so ambiguous hard-link changes are
-  reported conservatively as create and delete instead of a guessed rename.
-- Each SQLite database is bound to one root directory. A different root needs
-  a separate database file.
+- A scan is not a perfect filesystem snapshot. If a file changes during the
+  scan, the script retries once. A later change may be found on the next run.
+- A content change can be missed if the file keeps the same size and its old
+  modification time is restored.
+- Hard links share the same filesystem identity. If a rename is unclear, the
+  script reports a create and delete instead.
+- One database can track only one root directory. Use a separate database for
+  another directory.
 
 ## Performance measurements
 
-The following local benchmark used 10,000 files of 1 KiB each, distributed
-across 100 directories. The database was stored outside the scanned directory,
-and dataset generation was excluded. The current Windows results are medians
-of three trials on an Intel Core i5-1145G7 with Python 3.14.7. The macOS ARM64
-figures were recorded previously with Python 3.9.6, before the direct-path and
-size-bounded-read and parallel-hashing optimizations, so they are included only
-as a reference.
+This benchmark used 10,000 files of 1 KiB in 100 directories. Creating the test
+files was not included in the measured time, and the database was kept outside
+the scanned directory. The Windows time is the middle result from three runs on
+an Intel Core i5-1145G7 with Python 3.14.7. The macOS ARM64 results come from an
+older version before the latest speed improvements, so they are shown only for
+comparison.
 
 | Scenario | Entries | Result | Windows current | macOS ARM64 reference |
 |---|---:|---|---:|---:|
@@ -302,7 +317,3 @@ as a reference.
 | Unchanged scan | 10,100 | No changes | 0.83 s | 0.28-0.29 s |
 | 100 files changed from 1 KiB to 2 KiB | 10,100 | 100 modified | 0.82 s | 0.29 s |
 
-The unchanged scan is faster because valid stored hashes are reused instead of
-reading every file again. These numbers are illustrative: filesystem type,
-storage speed, cache state, file sizes, antivirus software, and operating
-system behavior can significantly affect real results.

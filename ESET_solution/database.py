@@ -106,8 +106,7 @@ def prepare_tables(connection: sqlite3.Connection, scanned_root: str) -> None:
     )
 
     # Take first row from scan_metadata
-    stored_root_row = connection.execute(
-        "SELECT value FROM scan_metadata WHERE key = 'scanned_root'").fetchone()
+    stored_root_row = connection.execute("SELECT value FROM scan_metadata WHERE key = 'scanned_root'").fetchone()
 
     # Initialize the database root on first use and reject snapshots from a different directory.
     if stored_root_row is None:
